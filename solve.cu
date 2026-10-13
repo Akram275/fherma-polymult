@@ -15,8 +15,17 @@
 //   FHERMA_OUT=staged|register  how c comes back                     [staged]
 //     staged:   memcpy through pinned buffers allocated at init, chunk by chunk
 //     register: cudaHostRegister the caller's vectors for the call, DMA directly
-//   FHERMA_CHUNKS=n             pipeline depth                       [8]
+//   FHERMA_CHUNKS=n             pipeline depth                       [2]
+//   FHERMA_THREADS=n            host threads for the staged memcpys   [min(16, cores / 2)]
 //   FHERMA_PROFILE=1            per-phase GPU times on stderr, every call
+//
+// Host side of a staged call: each input chunk is copied into pinned memory by
+// all the copy threads, then sent; once everything is enqueued, the calling
+// thread sizes the output vector (a zero fill) while the GPU works, and copies
+// each output chunk out of pinned memory as soon as it has landed. Measured on
+// rst-goose, one thread copies ~12 GB/s and 16 threads ~250 GB/s (cache-hot),
+// against ~400 us for a cudaHostRegister of one operand. Each chunk costs
+// ~25 us of CUDA API calls there, so the pipeline is shallow by default.
 #include "fherma.h"
 #include "rns_kernels.cuh"
 #include "rns_plan.h"
@@ -25,12 +34,17 @@
 #include <malloc.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -177,6 +191,125 @@ Copy copy_mode(const char* var) {
     throw std::runtime_error(std::string(var) + " must be staged or register");
 }
 
+// memcpy split into 64 KB pieces that the calling thread and a few workers
+// claim from a shared counter. The workers spin while a call is running (copies
+// come every few microseconds) and sleep on a condition variable between calls
+// (main.cpp spends ~13 ms on files between calls). Waking them takes ~150 us
+// here, so the caller never waits for them: it claims pieces itself from the
+// start, and workers join whenever they are up.
+//
+// next_ is (job << 32) | next piece. A job is opened by writing its
+// parameters while next_ is closed (piece index kClosed) and then storing
+// (job << 32) | 0; a piece is claimed by a compare-and-swap on next_, which
+// fails if the job has changed since it was read, so a late worker can never
+// claim a piece of a job with the parameters of another. The caller returns
+// once finished_ has counted every piece, and only then can the parameters
+// change, so no worker is ever inside a piece when they do.
+class CopyPool {
+public:
+    explicit CopyPool(int workers) {
+        for (int w = 0; w < workers; ++w) threads_.emplace_back([this] { work(); });
+    }
+    ~CopyPool() {
+        {
+            std::lock_guard<std::mutex> g(m_);
+            quit_.store(true);
+        }
+        cv_.notify_all();
+        for (auto& t : threads_) t.join();
+    }
+
+    void wake() {
+        {
+            std::lock_guard<std::mutex> g(m_);
+            awake_.store(true);
+        }
+        cv_.notify_all();
+    }
+    void rest() { awake_.store(false); }
+
+    void copy(void* dst, const void* src, size_t n) {
+        if (threads_.empty() || n <= kPiece) {
+            std::memcpy(dst, src, n);
+            return;
+        }
+        const uint64_t job = (next_.load(std::memory_order_relaxed) >> 32) + 1;
+        next_.store(job << 32 | kClosed, std::memory_order_relaxed);
+        dst_ = static_cast<char*>(dst);
+        src_ = static_cast<const char*>(src);
+        n_ = n;
+        // Release: a worker that reads this value then cannot win a CAS on the old job.
+        pieces_.store(static_cast<uint32_t>((n + kPiece - 1) / kPiece), std::memory_order_release);
+        finished_.store(0, std::memory_order_relaxed);
+        {
+            // Under the lock, so a worker deciding to sleep cannot miss it.
+            std::lock_guard<std::mutex> g(m_);
+            next_.store(job << 32, std::memory_order_release);
+        }
+        if (!awake_.load()) cv_.notify_all();
+        while (claim()) {
+        }
+        const uint32_t pieces = pieces_.load(std::memory_order_relaxed);
+        while (finished_.load(std::memory_order_acquire) < pieces) pause();
+    }
+
+private:
+    static constexpr size_t kPiece = 64 << 10;
+    static constexpr uint64_t kClosed = 0xffffffffu;
+
+    static void pause() {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
+
+    // Claims and copies one piece of the open job; false if there is none left.
+    bool claim() {
+        uint64_t v = next_.load(std::memory_order_acquire);
+        for (;;) {
+            const uint32_t i = static_cast<uint32_t>(v);
+            if (i >= pieces_.load(std::memory_order_acquire)) return false;   // kClosed too
+            if (next_.compare_exchange_weak(v, v + 1, std::memory_order_acq_rel)) break;
+        }
+        const size_t lo = static_cast<size_t>(static_cast<uint32_t>(v)) * kPiece;
+        std::memcpy(dst_ + lo, src_ + lo, std::min(kPiece, n_ - lo));
+        finished_.fetch_add(1, std::memory_order_release);
+        return true;
+    }
+
+    void work() {
+        for (;;) {
+            if (claim()) continue;
+            if (quit_.load()) return;
+            if (awake_.load()) {
+                pause();
+                continue;
+            }
+            std::unique_lock<std::mutex> g(m_);
+            const uint64_t seen = next_.load();
+            cv_.wait(g, [&] { return quit_.load() || awake_.load() || next_.load() != seen; });
+        }
+    }
+
+    std::vector<std::thread> threads_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::atomic<bool> quit_{false}, awake_{false};
+    std::atomic<uint64_t> next_{kClosed};
+    std::atomic<uint32_t> pieces_{0}, finished_{0};
+    char* dst_ = nullptr;
+    const char* src_ = nullptr;
+    size_t n_ = 0;
+};
+
+int copy_threads() {
+    if (const char* v = std::getenv("FHERMA_THREADS")) return std::max(1, std::atoi(v));
+    const int cores = static_cast<int>(std::thread::hardware_concurrency());
+    return std::max(1, std::min(16, cores / 2));
+}
+
 struct State {
     rns::Plan plan;
     rns::Tables t{};
@@ -192,6 +325,7 @@ struct State {
     uint32_t chunk = 0, chunks = 0;
     std::vector<cudaEvent_t> in_a, in_b, crt_done, out_done;
     Copy in_mode = Copy::staged, out_mode = Copy::staged;
+    std::unique_ptr<CopyPool> pool;
 
     bool profile = false;
     cudaEvent_t prof[5] = {};
@@ -248,11 +382,17 @@ void launch_crt(State& s, uint32_t k0, uint32_t count) {
     });
 }
 
-void report_profile(State& s) {
+using HostClock = std::chrono::steady_clock;
+
+// GPU phases from the events, then the host's own timeline: t[0] call start,
+// t[1] inputs sent, t[2] all enqueued, t[3] output sized, t[4] output copied.
+void report_profile(State& s, const HostClock::time_point (&t)[5]) {
     float ms[4];
     for (int i = 0; i < 4; ++i) cudaEventElapsedTime(&ms[i], s.prof[i], s.prof[i + 1]);
-    std::fprintf(stderr, "gpu us: in+decompose %.1f  ntt %.1f  crt %.1f  out-tail %.1f\n",
-                 ms[0] * 1e3, ms[1] * 1e3, ms[2] * 1e3, ms[3] * 1e3);
+    auto us = [&](int i) { return std::chrono::duration<double, std::micro>(t[i + 1] - t[i]).count(); };
+    std::fprintf(stderr, "gpu us: in+decompose %.1f  ntt %.1f  crt %.1f  out-tail %.1f | "
+                 "host us: send %.1f  enqueue %.1f  size-out %.1f  drain %.1f\n",
+                 ms[0] * 1e3, ms[1] * 1e3, ms[2] * 1e3, ms[3] * 1e3, us(0), us(1), us(2), us(3));
 }
 
 }  // namespace
@@ -274,6 +414,7 @@ void* fherma_init(const fherma::Point& p) {
         s->in_mode = copy_mode("FHERMA_IN");
         s->out_mode = copy_mode("FHERMA_OUT");
         s->profile = std::getenv("FHERMA_PROFILE") != nullptr;
+        s->pool.reset(new CopyPool(copy_threads() - 1));
 
         s->t = rns::Tables{pl.K, pl.L, pl.N,
                            upload(*s, pl.p), upload(*s, pl.pneg),
@@ -301,7 +442,7 @@ void* fherma_init(const fherma::Point& p) {
 
         // Chunks start on multiples of both block tiles.
         const char* env_chunks = std::getenv("FHERMA_CHUNKS");
-        const uint32_t want = std::max(1, env_chunks ? std::atoi(env_chunks) : 8);
+        const uint32_t want = std::max(1, env_chunks ? std::atoi(env_chunks) : 2);
         const uint32_t align = std::max(rns::kDecTile, rns::kCrtTile);
         s->chunk = (pl.N + want - 1) / want;
         s->chunk = (s->chunk + align - 1) / align * align;
@@ -349,12 +490,17 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
         hold.emplace_back(new Registration(in.a.data.data(), bytes));
         hold.emplace_back(new Registration(in.b.data.data(), bytes));
     }
+    HostClock::time_point t[5];
+    t[0] = HostClock::now();
     if (reg_out) {
         out.c.data.resize(words);
         hold.emplace_back(new Registration(out.c.data.data(), bytes));
-    } else {
-        out.c.data.reserve(words);
     }
+    s->pool->wake();
+    struct Rest {
+        CopyPool& p;
+        ~Rest() { p.rest(); }
+    } rest{*s->pool};
 
     if (s->profile) cudaEventRecord(s->prof[0], s->comp);
 
@@ -368,7 +514,7 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
             const size_t n = static_cast<size_t>(count) * L * sizeof(uint32_t);
             const uint32_t* from = src + off;
             if (!reg_in) {
-                std::memcpy(pin + off, src + off, n);
+                s->pool->copy(pin + off, src + off, n);
                 from = pin + off;
             }
             check(cudaMemcpyAsync(d_limbs + off, from, n, cudaMemcpyHostToDevice, s->h2d), "copy in");
@@ -379,6 +525,7 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     };
     send(in.a.data.data(), s->h_a, s->d_la, s->d_A, s->in_a);
     send(in.b.data.data(), s->h_b, s->d_lb, s->d_B, s->in_b);
+    t[1] = HostClock::now();
     if (s->profile) cudaEventRecord(s->prof[1], s->comp);
 
     launch_ntt(*s);
@@ -399,23 +546,29 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     }
     if (s->profile) cudaEventRecord(s->prof[3], s->comp);
     check(cudaGetLastError(), "launch");
+    t[2] = HostClock::now();
 
     if (reg_out) {
         check(cudaStreamSynchronize(s->d2h), "copy out");
     } else {
+        // Everything is enqueued: size the answer while the GPU works.
+        out.c.data.resize(words);
+        t[3] = HostClock::now();
         for (uint32_t ch = 0; ch < s->chunks; ++ch) {
             const size_t off = static_cast<size_t>(ch) * s->chunk * L;
             const size_t n = std::min(static_cast<size_t>(s->chunk) * L, words - off);
             check(cudaEventSynchronize(s->out_done[ch]), "copy out");
-            out.c.data.insert(out.c.data.end(), s->h_c + off, s->h_c + off + n);
+            s->pool->copy(out.c.data.data() + off, s->h_c + off, n * sizeof(uint32_t));
         }
     }
 
+    t[4] = HostClock::now();
+    if (reg_out) t[3] = t[2];
     if (s->profile) {
         check(cudaStreamWaitEvent(s->comp, s->out_done[s->chunks - 1], 0), "wait");
         cudaEventRecord(s->prof[4], s->comp);
         cudaEventSynchronize(s->prof[4]);
-        report_profile(*s);
+        report_profile(*s, t);
     }
     return out;
 }

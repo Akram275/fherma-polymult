@@ -34,6 +34,10 @@ endif()
 
 add_executable(solution main.cpp solve.cu)
 
+# solve.cu runs its host-side copies on a few std::threads.
+find_package(Threads REQUIRED)
+target_link_libraries(solution PRIVATE Threads::Threads)
+
 target_include_directories(solution PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CUPQC_SDK_DIR}/include
