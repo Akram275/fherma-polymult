@@ -14,7 +14,8 @@
 //   ntt_cols    fwd   A and B, stages t >= S         block: T elements, C columns
 //   ntt_rows          A and B fwd stages t < S, pointwise, A inv stages t < S
 //   ntt_cols    inv   A, stages t >= S
-//   crt               K x N residues -> limbs         block: kCrtTile coefficients
+//   crt               K x N residues -> limbs         block: kCrtTile coefficients,
+//                                                           kCrtGroups threads each
 //
 // The NTT is split at S = 2^ceil(logN / 2) (S = N for N <= 2048): the stages
 // whose butterflies span t >= S pair elements in the same residue class mod S
@@ -29,7 +30,8 @@ namespace rns {
 
 constexpr uint32_t kNttTile = 2048;   // elements per NTT block (8 KB per operand)
 constexpr uint32_t kDecTile = 32;     // coefficients per decompose block
-constexpr uint32_t kCrtTile = 64;     // coefficients per CRT block
+constexpr uint32_t kCrtTile = 32;     // coefficients per CRT block (one warp)
+constexpr uint32_t kCrtGroups = 4;    // prime groups: CRT block = kCrtTile * kCrtGroups threads
 
 // Device-side views of the Plan tables (pointers into device memory on the GPU,
 // into the Plan's vectors on the CPU).
@@ -141,14 +143,44 @@ RNS_HD void dec_compute(uint32_t b, const uint32_t* tile, uint32_t* res,
 }
 
 // --- crt -------------------------------------------------------------------
-// A block handles coefficients kb .. kb + nk - 1 (nk <= kCrtTile).
-// Phase 1 (items: nk)      one coefficient per thread into a padded tile.
-// Phase 2 (items: nk * L)  the tile out to c, contiguous, so writes coalesce.
+// A block handles coefficients kb .. kb + nk - 1 (nk <= kCrtTile), with the K
+// primes split into kCrtGroups groups, so each coefficient has kCrtGroups
+// threads for the products and a chunk of the output keeps the GPU busy.
+// Phase 1 (items: kCrtTile * K)          residue (j, kb + b) to ytile[j * kCrtTile + b]:
+//                                        consecutive items are consecutive b, so
+//                                        reads coalesce, all loads in flight at once.
+// Phase 2 (items: kCrtTile * kCrtGroups) item (g, b): the partial of coefficient b
+//                                        over prime group g. A warp is one g and all
+//                                        b, so its M loads are uniform and its smem
+//                                        accesses are consecutive words.
+// Phase 3 (items: nk)                    coefficient b from its partials, into a
+//                                        padded tile.
+// Phase 4 (items: nk * L)                the tile out to c, contiguous, so writes coalesce.
+//
+// part[(g * (L + 2) + w) * kCrtTile + b] is word w of group g's partial of b.
+
+RNS_HD void crt_load(uint32_t i, uint32_t* ytile, const uint32_t* Y, uint32_t kb,
+                     uint32_t nk, uint32_t N) {
+    const uint32_t b = i % kCrtTile, j = i / kCrtTile;
+    if (b < nk) ytile[i] = Y[static_cast<size_t>(j) * N + kb + b];
+}
 
 template <int L>
-RNS_HD void crt_compute(uint32_t b, uint32_t* tile, const uint32_t* Y, uint32_t kb,
-                        uint32_t N, const CrtView& v) {
-    crt_one<L>(Y + kb + b, N, v, tile + b * (L + 1));
+RNS_HD void crt_products(uint32_t i, const uint32_t* ytile, uint32_t* part, double* fracs,
+                         uint32_t nk, const CrtView& v) {
+    const uint32_t b = i % kCrtTile, g = i / kCrtTile;
+    if (b >= nk) return;
+    const int j0 = static_cast<int>(g * v.K / kCrtGroups);
+    const int j1 = static_cast<int>((g + 1) * v.K / kCrtGroups);
+    crt_partial<L>(ytile + b, kCrtTile, j0, j1, v,
+                   part + g * (L + 2) * kCrtTile + b, kCrtTile, fracs + g * kCrtTile + b);
+}
+
+template <int L>
+RNS_HD void crt_combine(uint32_t b, const uint32_t* part, const double* fracs, uint32_t* tile,
+                        const CrtView& v) {
+    crt_finish<L>(part + b, kCrtTile, (L + 2) * kCrtTile, kCrtGroups, fracs + b, kCrtTile, v,
+                  tile + b * (L + 1));
 }
 
 RNS_HD void crt_store(uint32_t i, const uint32_t* tile, uint32_t* c, uint32_t kb, int L) {

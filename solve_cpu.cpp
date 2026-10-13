@@ -151,10 +151,16 @@ void crt(const State& s, std::vector<uint32_t>& c) {
     const uint32_t blocks = (N + rns::kCrtTile - 1) / rns::kCrtTile;
 #pragma omp parallel for
     for (uint32_t blk = 0; blk < blocks; ++blk) {
+        uint32_t ytile[rns::kCrtTile * rns::kMaxK];
+        uint32_t part[rns::kCrtGroups * (L + 2) * rns::kCrtTile];
+        double fracs[rns::kCrtGroups * rns::kCrtTile];
         uint32_t tile[rns::kCrtTile * (L + 1)];
         const uint32_t kb = blk * rns::kCrtTile;
         const uint32_t nk = std::min(rns::kCrtTile, N - kb);
-        phase(nk, [&](uint32_t b) { rns::crt_compute<L>(b, tile, s.A.data(), kb, N, v); });
+        phase(rns::kCrtTile * v.K, [&](uint32_t i) { rns::crt_load(i, ytile, s.A.data(), kb, nk, N); });
+        phase(rns::kCrtTile * rns::kCrtGroups,
+              [&](uint32_t i) { rns::crt_products<L>(i, ytile, part, fracs, nk, v); });
+        phase(nk, [&](uint32_t b) { rns::crt_combine<L>(b, part, fracs, tile, v); });
         phase(nk * L, [&](uint32_t i) { rns::crt_store(i, tile, c.data(), kb, L); });
     }
 }

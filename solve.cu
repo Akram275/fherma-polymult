@@ -140,14 +140,25 @@ k_ntt_rows_mul(uint32_t* __restrict__ A, const uint32_t* __restrict__ B, rns::Ta
     for (uint32_t i = threadIdx.x; i < g.T; i += blockDim.x) a[i] = ta[i];
 }
 
+constexpr uint32_t kCrtThreads = rns::kCrtTile * rns::kCrtGroups;
+
 template <int L>
-__global__ void __launch_bounds__(rns::kCrtTile)
+__global__ void __launch_bounds__(kCrtThreads)
 k_crt(const uint32_t* __restrict__ Y, uint32_t* __restrict__ c,
       uint32_t k0, uint32_t count, uint32_t N, rns::CrtView v) {
+    __shared__ uint32_t ytile[rns::kCrtTile * rns::kMaxK];
+    __shared__ uint32_t part[rns::kCrtGroups * (L + 2) * rns::kCrtTile];
+    __shared__ double fracs[rns::kCrtGroups * rns::kCrtTile];
     __shared__ uint32_t tile[rns::kCrtTile * (L + 1)];
     const uint32_t kb = k0 + blockIdx.x * rns::kCrtTile;
     const uint32_t nk = min(rns::kCrtTile, k0 + count - kb);
-    if (threadIdx.x < nk) rns::crt_compute<L>(threadIdx.x, tile, Y, kb, N, v);
+    for (uint32_t i = threadIdx.x; i < rns::kCrtTile * v.K; i += blockDim.x) {
+        rns::crt_load(i, ytile, Y, kb, nk, N);
+    }
+    __syncthreads();
+    rns::crt_products<L>(threadIdx.x, ytile, part, fracs, nk, v);
+    __syncthreads();
+    if (threadIdx.x < nk) rns::crt_combine<L>(threadIdx.x, part, fracs, tile, v);
     __syncthreads();
     for (uint32_t i = threadIdx.x; i < nk * L; i += blockDim.x) {
         rns::crt_store(i, tile, c, kb, L);
@@ -233,7 +244,7 @@ void launch_crt(State& s, uint32_t k0, uint32_t count) {
     const uint32_t blocks = (count + rns::kCrtTile - 1) / rns::kCrtTile;
     rns::with_L(s.t.L, [&](auto Lc) {
         constexpr int L = decltype(Lc)::value;
-        k_crt<L><<<blocks, rns::kCrtTile, 0, s.comp>>>(s.d_A, s.d_c, k0, count, s.t.N, s.crt);
+        k_crt<L><<<blocks, kCrtThreads, 0, s.comp>>>(s.d_A, s.d_c, k0, count, s.t.N, s.crt);
     });
 }
 
