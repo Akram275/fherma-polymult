@@ -1,0 +1,14 @@
+# Build outputs
+build/
+solution_cpu
+__pycache__/
+
+# Local run logs and backups (not part of the submission)
+*.log
+backup/
+
+# LaTeX build by-products (the .tex and .pdf are kept)
+notes/*.aux
+notes/*.log
+notes/*.out
+notes/*.toc

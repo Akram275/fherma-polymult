@@ -1,0 +1,430 @@
+// A CUDA answer to polymul/negacyclic@1.0.0: RNS + negacyclic NTT + CRT.
+//
+// The arithmetic is rns.cuh, the schedule is rns_kernels.cuh, and both are
+// checked on the CPU by solve_cpu.cpp (see run_tests.sh). This file only puts
+// them on the GPU: kernels that deal each phase's items out to threads, and a
+// host side that streams the operands in and the answer out in chunks, so the
+// copies overlap the decompose at the start and the CRT at the end.
+//
+//   h2d   a0 a1 .. b0 b1 ..                                      (copy engine)
+//   comp     d(a0) d(a1) .. d(b0) .. | NTT fwd, x, inv | crt0 crt1 ..
+//   d2h                                                     c0   c1  ..
+//
+// Tuning knobs, read once in fherma_init (defaults in brackets):
+//   FHERMA_IN=staged|register   how a and b reach the GPU            [staged]
+//   FHERMA_OUT=staged|register  how c comes back                     [staged]
+//     staged:   memcpy through pinned buffers allocated at init, chunk by chunk
+//     register: cudaHostRegister the caller's vectors for the call, DMA directly
+//   FHERMA_CHUNKS=n             pipeline depth                       [8]
+//   FHERMA_PROFILE=1            per-phase GPU times on stderr, every call
+#include "fherma.h"
+#include "rns_kernels.cuh"
+#include "rns_plan.h"
+
+#include <cuda_runtime.h>
+#include <malloc.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+constexpr int kThreads = 256;
+
+void check(cudaError_t e, const char* what) {
+    if (e != cudaSuccess) {
+        throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernels. Each loop is one phase of rns_kernels.cuh, dealt out to the block.
+
+__global__ void __launch_bounds__(kThreads)
+k_decompose(const uint32_t* __restrict__ limbs, uint32_t* __restrict__ res,
+            uint32_t k0, uint32_t count, rns::Tables t) {
+    __shared__ uint32_t tile[rns::kDecTile * (rns::kMaxL + 1)];
+    const uint32_t kb = k0 + blockIdx.x * rns::kDecTile;
+    const uint32_t nk = min(rns::kDecTile, k0 + count - kb);
+    for (uint32_t i = threadIdx.x; i < nk * t.L; i += blockDim.x) {
+        rns::dec_load(i, tile, limbs, kb, t.L);
+    }
+    __syncthreads();
+    for (uint32_t b = threadIdx.x; b < rns::kDecTile * t.K; b += blockDim.x) {
+        rns::dec_compute(b, tile, res, kb, nk, t);
+    }
+}
+
+// Column pass: forward on A and B together (sharing the twiddle loads), or
+// inverse on A alone (B == nullptr).
+template <bool kForward>
+__global__ void __launch_bounds__(kThreads)
+k_ntt_cols(uint32_t* __restrict__ A, uint32_t* __restrict__ B, rns::Tables t, rns::NttGeom g) {
+    __shared__ uint32_t ta[rns::kNttTile], tb[rns::kNttTile];
+    const int j = blockIdx.y;
+    const size_t row = static_cast<size_t>(j) * t.N;
+    const uint32_t r0 = blockIdx.x << g.logC;
+    uint32_t* a = A + row;
+    uint32_t* b = B ? B + row : nullptr;
+    const uint32_t* w = (kForward ? t.psi : t.ipsi) + row;
+    const uint32_t* ws = (kForward ? t.psi_s : t.ipsi_s) + row;
+    const uint32_t p = t.p[j];
+
+    for (uint32_t i = threadIdx.x; i < g.T; i += blockDim.x) {
+        const uint32_t k = rns::col_global(i, r0, g);
+        ta[i] = a[k];
+        if (b) tb[i] = b[k];
+    }
+    __syncthreads();
+    for (uint32_t s = 0; s < g.logR; ++s) {
+        const uint32_t lt = kForward ? g.logR - 1 - s : s;
+        for (uint32_t bf = threadIdx.x; bf < g.T / 2; bf += blockDim.x) {
+            const rns::Pair pr = rns::col_pair(bf, lt, g);
+            if (kForward) {
+                rns::fwd_butterfly(ta, pr, w, ws, p);
+                if (b) rns::fwd_butterfly(tb, pr, w, ws, p);
+            } else {
+                rns::inv_butterfly(ta, pr, w, ws, p);
+            }
+        }
+        __syncthreads();
+    }
+    for (uint32_t i = threadIdx.x; i < g.T; i += blockDim.x) {
+        const uint32_t k = rns::col_global(i, r0, g);
+        a[k] = ta[i];
+        if (b) b[k] = tb[i];
+    }
+}
+
+// Row pass: forward on A and B, pointwise into A, inverse on A, one tile.
+__global__ void __launch_bounds__(kThreads)
+k_ntt_rows_mul(uint32_t* __restrict__ A, const uint32_t* __restrict__ B, rns::Tables t, rns::NttGeom g) {
+    __shared__ uint32_t ta[rns::kNttTile], tb[rns::kNttTile];
+    const int j = blockIdx.y;
+    const size_t row = static_cast<size_t>(j) * t.N;
+    const uint32_t base = blockIdx.x * g.T;
+    uint32_t* a = A + row + base;
+    const uint32_t* b = B + row + base;
+    const uint32_t p = t.p[j];
+
+    for (uint32_t i = threadIdx.x; i < g.T; i += blockDim.x) {
+        ta[i] = a[i];
+        tb[i] = b[i];
+    }
+    __syncthreads();
+    for (uint32_t s = 0; s < g.logS; ++s) {
+        const uint32_t lt = g.logS - 1 - s;
+        for (uint32_t bf = threadIdx.x; bf < g.T / 2; bf += blockDim.x) {
+            const rns::Pair pr = rns::row_pair(bf, lt, base, g);
+            rns::fwd_butterfly(ta, pr, t.psi + row, t.psi_s + row, p);
+            rns::fwd_butterfly(tb, pr, t.psi + row, t.psi_s + row, p);
+        }
+        __syncthreads();
+    }
+    for (uint32_t i = threadIdx.x; i < g.T; i += blockDim.x) {
+        ta[i] = rns::pointwise(ta[i], tb[i], t, j);
+    }
+    __syncthreads();
+    for (uint32_t lt = 0; lt < g.logS; ++lt) {
+        for (uint32_t bf = threadIdx.x; bf < g.T / 2; bf += blockDim.x) {
+            rns::inv_butterfly(ta, rns::row_pair(bf, lt, base, g), t.ipsi + row, t.ipsi_s + row, p);
+        }
+        __syncthreads();
+    }
+    for (uint32_t i = threadIdx.x; i < g.T; i += blockDim.x) a[i] = ta[i];
+}
+
+template <int L>
+__global__ void __launch_bounds__(rns::kCrtTile)
+k_crt(const uint32_t* __restrict__ Y, uint32_t* __restrict__ c,
+      uint32_t k0, uint32_t count, uint32_t N, rns::CrtView v) {
+    __shared__ uint32_t tile[rns::kCrtTile * (L + 1)];
+    const uint32_t kb = k0 + blockIdx.x * rns::kCrtTile;
+    const uint32_t nk = min(rns::kCrtTile, k0 + count - kb);
+    if (threadIdx.x < nk) rns::crt_compute<L>(threadIdx.x, tile, Y, kb, N, v);
+    __syncthreads();
+    for (uint32_t i = threadIdx.x; i < nk * L; i += blockDim.x) {
+        rns::crt_store(i, tile, c, kb, L);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host side.
+
+enum class Copy { staged, registered };
+
+Copy copy_mode(const char* var) {
+    const char* v = std::getenv(var);
+    if (!v || !std::strcmp(v, "staged")) return Copy::staged;
+    if (!std::strcmp(v, "register")) return Copy::registered;
+    throw std::runtime_error(std::string(var) + " must be staged or register");
+}
+
+struct State {
+    rns::Plan plan;
+    rns::Tables t{};
+    rns::NttGeom g{};
+    rns::CrtView crt{};
+
+    std::vector<void*> device;              // everything cudaMalloc'd, for free
+    uint32_t *d_la = nullptr, *d_lb = nullptr, *d_c = nullptr;   // N x L limbs
+    uint32_t *d_A = nullptr, *d_B = nullptr;                     // K x N residues
+    uint32_t *h_a = nullptr, *h_b = nullptr, *h_c = nullptr;     // pinned staging
+
+    cudaStream_t comp = nullptr, h2d = nullptr, d2h = nullptr;
+    uint32_t chunk = 0, chunks = 0;
+    std::vector<cudaEvent_t> in_a, in_b, crt_done, out_done;
+    Copy in_mode = Copy::staged, out_mode = Copy::staged;
+
+    bool profile = false;
+    cudaEvent_t prof[5] = {};
+};
+
+template <class T>
+T* device_alloc(State& s, size_t count) {
+    void* p = nullptr;
+    check(cudaMalloc(&p, count * sizeof(T)), "cudaMalloc");
+    s.device.push_back(p);
+    return static_cast<T*>(p);
+}
+
+template <class T>
+const T* upload(State& s, const std::vector<T>& v) {
+    T* d = device_alloc<T>(s, v.size());
+    check(cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice), "upload");
+    return d;
+}
+
+// Pins a caller's buffer for one call, and unpins it however the call ends.
+struct Registration {
+    void* at = nullptr;
+    Registration(const void* p, size_t bytes) {
+        check(cudaHostRegister(const_cast<void*>(p), bytes, cudaHostRegisterDefault), "cudaHostRegister");
+        at = const_cast<void*>(p);
+    }
+    ~Registration() {
+        if (at) cudaHostUnregister(at);
+    }
+    Registration(const Registration&) = delete;
+    Registration& operator=(const Registration&) = delete;
+};
+
+void launch_decompose(State& s, const uint32_t* limbs, uint32_t* res, uint32_t k0, uint32_t count) {
+    const uint32_t blocks = (count + rns::kDecTile - 1) / rns::kDecTile;
+    k_decompose<<<blocks, kThreads, 0, s.comp>>>(limbs, res, k0, count, s.t);
+}
+
+void launch_ntt(State& s) {
+    const rns::NttGeom& g = s.g;
+    const dim3 cols(1u << (g.logS - g.logC), s.t.K);
+    const dim3 rows(s.t.N / g.T, s.t.K);
+    if (g.logR) k_ntt_cols<true><<<cols, kThreads, 0, s.comp>>>(s.d_A, s.d_B, s.t, g);
+    k_ntt_rows_mul<<<rows, kThreads, 0, s.comp>>>(s.d_A, s.d_B, s.t, g);
+    if (g.logR) k_ntt_cols<false><<<cols, kThreads, 0, s.comp>>>(s.d_A, nullptr, s.t, g);
+}
+
+void launch_crt(State& s, uint32_t k0, uint32_t count) {
+    const uint32_t blocks = (count + rns::kCrtTile - 1) / rns::kCrtTile;
+    rns::with_L(s.t.L, [&](auto Lc) {
+        constexpr int L = decltype(Lc)::value;
+        k_crt<L><<<blocks, rns::kCrtTile, 0, s.comp>>>(s.d_A, s.d_c, k0, count, s.t.N, s.crt);
+    });
+}
+
+void report_profile(State& s) {
+    float ms[4];
+    for (int i = 0; i < 4; ++i) cudaEventElapsedTime(&ms[i], s.prof[i], s.prof[i + 1]);
+    std::fprintf(stderr, "gpu us: in+decompose %.1f  ntt %.1f  crt %.1f  out-tail %.1f\n",
+                 ms[0] * 1e3, ms[1] * 1e3, ms[2] * 1e3, ms[3] * 1e3);
+}
+
+}  // namespace
+
+void* fherma_init(const fherma::Point& p) {
+    // Load every kernel now rather than on first launch, inside the timed call.
+    setenv("CUDA_MODULE_LOADING", "EAGER", 0);
+    // Keep large blocks on the heap once freed, so the vectors main.cpp and
+    // fherma_run allocate per case reuse resident pages instead of fresh mmaps
+    // that fault on first touch.
+    mallopt(M_MMAP_THRESHOLD, 32 << 20);    // glibc's maximum
+    mallopt(M_TRIM_THRESHOLD, 512 << 20);
+
+    auto* s = new State{};
+    try {
+        s->plan = rns::make_plan(p.N, p.q.data.data(), static_cast<int>(p.L));
+        const rns::Plan& pl = s->plan;
+        s->g = rns::make_geom(pl.logN);
+        s->in_mode = copy_mode("FHERMA_IN");
+        s->out_mode = copy_mode("FHERMA_OUT");
+        s->profile = std::getenv("FHERMA_PROFILE") != nullptr;
+
+        s->t = rns::Tables{pl.K, pl.L, pl.N,
+                           upload(*s, pl.p), upload(*s, pl.pneg),
+                           upload(*s, pl.pow2), upload(*s, pl.pow2_s),
+                           upload(*s, pl.psi), upload(*s, pl.psi_s),
+                           upload(*s, pl.ipsi), upload(*s, pl.ipsi_s),
+                           upload(*s, pl.scale), upload(*s, pl.scale_s)};
+        s->crt = rns::CrtView{pl.K, rns::Modulus{upload(*s, pl.q), pl.L, pl.q_top},
+                              upload(*s, pl.p_recip), upload(*s, pl.M), upload(*s, pl.negvP)};
+
+        const size_t words = static_cast<size_t>(pl.N) * pl.L;
+        const size_t residues = static_cast<size_t>(pl.K) * pl.N;
+        s->d_la = device_alloc<uint32_t>(*s, words);
+        s->d_lb = device_alloc<uint32_t>(*s, words);
+        s->d_c = device_alloc<uint32_t>(*s, words);
+        s->d_A = device_alloc<uint32_t>(*s, residues);
+        s->d_B = device_alloc<uint32_t>(*s, residues);
+        check(cudaMallocHost(&s->h_a, words * sizeof(uint32_t)), "pinned a");
+        check(cudaMallocHost(&s->h_b, words * sizeof(uint32_t)), "pinned b");
+        check(cudaMallocHost(&s->h_c, words * sizeof(uint32_t)), "pinned c");
+
+        check(cudaStreamCreateWithFlags(&s->comp, cudaStreamNonBlocking), "stream");
+        check(cudaStreamCreateWithFlags(&s->h2d, cudaStreamNonBlocking), "stream");
+        check(cudaStreamCreateWithFlags(&s->d2h, cudaStreamNonBlocking), "stream");
+
+        // Chunks start on multiples of both block tiles.
+        const char* env_chunks = std::getenv("FHERMA_CHUNKS");
+        const uint32_t want = std::max(1, env_chunks ? std::atoi(env_chunks) : 8);
+        const uint32_t align = std::max(rns::kDecTile, rns::kCrtTile);
+        s->chunk = (pl.N + want - 1) / want;
+        s->chunk = (s->chunk + align - 1) / align * align;
+        s->chunk = std::min(s->chunk, pl.N);
+        s->chunks = (pl.N + s->chunk - 1) / s->chunk;
+        for (auto* evs : {&s->in_a, &s->in_b, &s->crt_done, &s->out_done}) {
+            evs->resize(s->chunks);
+            for (auto& e : *evs) check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event");
+        }
+        for (auto& e : s->prof) check(cudaEventCreate(&e), "event");
+
+        // One untimed run, so nothing the first case pays for is a first time.
+        fherma::Inputs warm;
+        warm.a.shape = warm.b.shape = {static_cast<int64_t>(pl.N), static_cast<int64_t>(pl.L)};
+        warm.a.data.assign(words, 0);
+        warm.b.data.assign(words, 0);
+        const bool profile = s->profile;
+        s->profile = false;
+        fherma_run(s, warm);
+        s->profile = profile;
+    } catch (...) {
+        fherma_free(s);
+        throw;
+    }
+    return s;
+}
+
+fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
+    auto* s = static_cast<State*>(state);
+    const uint32_t N = s->t.N;
+    const uint32_t L = static_cast<uint32_t>(s->t.L);
+    const size_t words = static_cast<size_t>(N) * L;
+    const size_t bytes = words * sizeof(uint32_t);
+    if (in.a.data.size() != words || in.b.data.size() != words) {
+        throw std::runtime_error("operand size does not match the point");
+    }
+
+    fherma::Outputs out;
+    out.c.shape = {static_cast<int64_t>(N), static_cast<int64_t>(L)};
+
+    const bool reg_in = s->in_mode == Copy::registered;
+    const bool reg_out = s->out_mode == Copy::registered;
+    std::vector<std::unique_ptr<Registration>> hold;
+    if (reg_in) {
+        hold.emplace_back(new Registration(in.a.data.data(), bytes));
+        hold.emplace_back(new Registration(in.b.data.data(), bytes));
+    }
+    if (reg_out) {
+        out.c.data.resize(words);
+        hold.emplace_back(new Registration(out.c.data.data(), bytes));
+    } else {
+        out.c.data.reserve(words);
+    }
+
+    if (s->profile) cudaEventRecord(s->prof[0], s->comp);
+
+    // In: each chunk's copy, then its decompose once the copy has landed.
+    auto send = [&](const uint32_t* src, uint32_t* pin, uint32_t* d_limbs, uint32_t* d_res,
+                    std::vector<cudaEvent_t>& landed) {
+        for (uint32_t ch = 0; ch < s->chunks; ++ch) {
+            const uint32_t k0 = ch * s->chunk;
+            const uint32_t count = std::min(s->chunk, N - k0);
+            const size_t off = static_cast<size_t>(k0) * L;
+            const size_t n = static_cast<size_t>(count) * L * sizeof(uint32_t);
+            const uint32_t* from = src + off;
+            if (!reg_in) {
+                std::memcpy(pin + off, src + off, n);
+                from = pin + off;
+            }
+            check(cudaMemcpyAsync(d_limbs + off, from, n, cudaMemcpyHostToDevice, s->h2d), "copy in");
+            check(cudaEventRecord(landed[ch], s->h2d), "event");
+            check(cudaStreamWaitEvent(s->comp, landed[ch], 0), "wait");
+            launch_decompose(*s, d_limbs, d_res, k0, count);
+        }
+    };
+    send(in.a.data.data(), s->h_a, s->d_la, s->d_A, s->in_a);
+    send(in.b.data.data(), s->h_b, s->d_lb, s->d_B, s->in_b);
+    if (s->profile) cudaEventRecord(s->prof[1], s->comp);
+
+    launch_ntt(*s);
+    if (s->profile) cudaEventRecord(s->prof[2], s->comp);
+
+    // Out: each chunk's CRT, then its copy back once the CRT is done.
+    uint32_t* dst = reg_out ? out.c.data.data() : s->h_c;
+    for (uint32_t ch = 0; ch < s->chunks; ++ch) {
+        const uint32_t k0 = ch * s->chunk;
+        const uint32_t count = std::min(s->chunk, N - k0);
+        const size_t off = static_cast<size_t>(k0) * L;
+        launch_crt(*s, k0, count);
+        check(cudaEventRecord(s->crt_done[ch], s->comp), "event");
+        check(cudaStreamWaitEvent(s->d2h, s->crt_done[ch], 0), "wait");
+        check(cudaMemcpyAsync(dst + off, s->d_c + off, static_cast<size_t>(count) * L * sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost, s->d2h), "copy out");
+        check(cudaEventRecord(s->out_done[ch], s->d2h), "event");
+    }
+    if (s->profile) cudaEventRecord(s->prof[3], s->comp);
+    check(cudaGetLastError(), "launch");
+
+    if (reg_out) {
+        check(cudaStreamSynchronize(s->d2h), "copy out");
+    } else {
+        for (uint32_t ch = 0; ch < s->chunks; ++ch) {
+            const size_t off = static_cast<size_t>(ch) * s->chunk * L;
+            const size_t n = std::min(static_cast<size_t>(s->chunk) * L, words - off);
+            check(cudaEventSynchronize(s->out_done[ch]), "copy out");
+            out.c.data.insert(out.c.data.end(), s->h_c + off, s->h_c + off + n);
+        }
+    }
+
+    if (s->profile) {
+        check(cudaStreamWaitEvent(s->comp, s->out_done[s->chunks - 1], 0), "wait");
+        cudaEventRecord(s->prof[4], s->comp);
+        cudaEventSynchronize(s->prof[4]);
+        report_profile(*s);
+    }
+    return out;
+}
+
+void fherma_free(void* state) {
+    auto* s = static_cast<State*>(state);
+    if (!s) return;
+    cudaDeviceSynchronize();
+    for (auto* evs : {&s->in_a, &s->in_b, &s->crt_done, &s->out_done}) {
+        for (auto e : *evs) cudaEventDestroy(e);
+    }
+    for (auto e : s->prof) {
+        if (e) cudaEventDestroy(e);
+    }
+    for (auto st : {s->comp, s->h2d, s->d2h}) {
+        if (st) cudaStreamDestroy(st);
+    }
+    for (void* p : s->device) cudaFree(p);
+    cudaFreeHost(s->h_a);
+    cudaFreeHost(s->h_b);
+    cudaFreeHost(s->h_c);
+    delete s;
+}
