@@ -68,7 +68,9 @@ void decompose(const State& s, const std::vector<uint32_t>& limbs, std::vector<u
 }
 
 // Column pass over A (and B when given), forward or inverse.
-void ntt_cols(State& s, bool forward, bool both) {
+// Column pass on X, and on Y too when given (forward only).
+void ntt_cols(State& s, bool forward, std::vector<uint32_t>& X, std::vector<uint32_t>* Y) {
+    const bool both = Y != nullptr;
     const rns::Tables& t = s.t;
     const rns::NttGeom g = s.g;
     if (g.logR == 0) return;
@@ -77,8 +79,8 @@ void ntt_cols(State& s, bool forward, bool both) {
     for (int j = 0; j < t.K; ++j) {
         for (uint32_t blk = 0; blk < blocks; ++blk) {
             std::vector<uint32_t> ta(g.T), tb(g.T);
-            uint32_t* a = &s.A[static_cast<size_t>(j) * t.N];
-            uint32_t* b = &s.B[static_cast<size_t>(j) * t.N];
+            uint32_t* a = &X[static_cast<size_t>(j) * t.N];
+            uint32_t* b = both ? &(*Y)[static_cast<size_t>(j) * t.N] : nullptr;
             const uint32_t r0 = blk << g.logC;
             const uint32_t* w = (forward ? t.psi : t.ipsi) + static_cast<size_t>(j) * t.N;
             const uint32_t* ws = (forward ? t.psi_s : t.ipsi_s) + static_cast<size_t>(j) * t.N;
@@ -109,7 +111,36 @@ void ntt_cols(State& s, bool forward, bool both) {
 }
 
 // Row pass: forward on A and B, pointwise into A, inverse on A.
-void ntt_rows_mul(State& s) {
+// Forward row stages on A alone, back to A (k_ntt_rows_fwd): lets a's whole
+// forward transform run while b is still on its way in.
+void ntt_rows_fwd(State& s) {
+    const rns::Tables& t = s.t;
+    const rns::NttGeom g = s.g;
+    const uint32_t blocks = t.N / g.T;
+#pragma omp parallel for collapse(2)
+    for (int j = 0; j < t.K; ++j) {
+        for (uint32_t blk = 0; blk < blocks; ++blk) {
+            std::vector<uint32_t> ta(g.T);
+            const uint32_t base = blk * g.T;
+            uint32_t* a = &s.A[static_cast<size_t>(j) * t.N + base];
+            const size_t row = static_cast<size_t>(j) * t.N;
+            const uint32_t p = t.p[j];
+
+            phase(g.T, [&](uint32_t i) { ta[i] = a[i]; });
+            for (uint32_t k = 0; k < g.logS; ++k) {
+                const uint32_t lt = g.logS - 1 - k;
+                stage(g, [&](uint32_t bf) { return rns::row_pair(bf, lt, base, g); },
+                      [&](const rns::Pair& pr) {
+                          rns::fwd_butterfly(ta.data(), pr, t.psi + row, t.psi_s + row, p);
+                      });
+            }
+            phase(g.T, [&](uint32_t i) { a[i] = ta[i]; });
+        }
+    }
+}
+
+// a_ready: A already went through ntt_rows_fwd, so only B's forward stages run.
+void ntt_rows_mul(State& s, bool a_ready) {
     const rns::Tables& t = s.t;
     const rns::NttGeom g = s.g;
     const uint32_t blocks = t.N / g.T;
@@ -128,7 +159,7 @@ void ntt_rows_mul(State& s) {
                 const uint32_t lt = g.logS - 1 - k;
                 stage(g, [&](uint32_t bf) { return rns::row_pair(bf, lt, base, g); },
                       [&](const rns::Pair& pr) {
-                          rns::fwd_butterfly(ta.data(), pr, t.psi + row, t.psi_s + row, p);
+                          if (!a_ready) rns::fwd_butterfly(ta.data(), pr, t.psi + row, t.psi_s + row, p);
                           rns::fwd_butterfly(tb.data(), pr, t.psi + row, t.psi_s + row, p);
                       });
             }
@@ -184,9 +215,12 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
 
     decompose(*s, in.a.data, s->A);
     decompose(*s, in.b.data, s->B);
-    ntt_cols(*s, /*forward=*/true, /*both=*/true);
-    ntt_rows_mul(*s);
-    ntt_cols(*s, /*forward=*/false, /*both=*/false);
+    // The GPU order: a's forward transform while b is still arriving, then b's.
+    ntt_cols(*s, /*forward=*/true, s->A, nullptr);
+    ntt_rows_fwd(*s);
+    ntt_cols(*s, /*forward=*/true, s->B, nullptr);
+    ntt_rows_mul(*s, /*a_ready=*/true);
+    ntt_cols(*s, /*forward=*/false, s->A, nullptr);
 
     fherma::Outputs out;
     out.c.shape = {static_cast<int64_t>(N), static_cast<int64_t>(L)};

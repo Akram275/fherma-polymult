@@ -133,7 +133,32 @@ k_ntt_cols(uint32_t* __restrict__ A, uint32_t* __restrict__ B, rns::Tables t, rn
     }
 }
 
-// Row pass: forward on A and B, pointwise into A, inverse on A, one tile.
+// Row pass, forward stages on A alone, back to A: a's whole forward transform
+// can then run while b is still being copied in.
+__global__ void __launch_bounds__(kThreads)
+k_ntt_rows_fwd(uint32_t* __restrict__ A, rns::Tables t, rns::NttGeom g) {
+    __shared__ uint32_t ta[rns::kNttTile];
+    const int j = blockIdx.y;
+    const size_t row = static_cast<size_t>(j) * t.N;
+    const uint32_t base = blockIdx.x * g.T;
+    uint32_t* a = A + row + base;
+    const uint32_t p = t.p[j];
+
+    for (uint32_t i = threadIdx.x; i < g.T; i += blockDim.x) ta[i] = a[i];
+    __syncthreads();
+    for (uint32_t s = 0; s < g.logS; ++s) {
+        const uint32_t lt = g.logS - 1 - s;
+        for (uint32_t bf = threadIdx.x; bf < g.T / 2; bf += blockDim.x) {
+            rns::fwd_butterfly(ta, rns::row_pair(bf, lt, base, g), t.psi + row, t.psi_s + row, p);
+        }
+        __syncthreads();
+    }
+    for (uint32_t i = threadIdx.x; i < g.T; i += blockDim.x) a[i] = ta[i];
+}
+
+// Row pass: forward on A (unless kAReady: k_ntt_rows_fwd did it) and B,
+// pointwise into A, inverse on A, one tile.
+template <bool kAReady>
 __global__ void __launch_bounds__(kThreads)
 k_ntt_rows_mul(uint32_t* __restrict__ A, const uint32_t* __restrict__ B, rns::Tables t, rns::NttGeom g) {
     __shared__ uint32_t ta[rns::kNttTile], tb[rns::kNttTile];
@@ -153,7 +178,7 @@ k_ntt_rows_mul(uint32_t* __restrict__ A, const uint32_t* __restrict__ B, rns::Ta
         const uint32_t lt = g.logS - 1 - s;
         for (uint32_t bf = threadIdx.x; bf < g.T / 2; bf += blockDim.x) {
             const rns::Pair pr = rns::row_pair(bf, lt, base, g);
-            rns::fwd_butterfly(ta, pr, t.psi + row, t.psi_s + row, p);
+            if (!kAReady) rns::fwd_butterfly(ta, pr, t.psi + row, t.psi_s + row, p);
             rns::fwd_butterfly(tb, pr, t.psi + row, t.psi_s + row, p);
         }
         __syncthreads();
@@ -496,12 +521,23 @@ void launch_decompose(State& s, const uint32_t* limbs, uint32_t* res, uint32_t k
     k_decompose<<<blocks, kThreads, 0, s.comp>>>(limbs, res, k0, count, s.t);
 }
 
-void launch_ntt(State& s) {
+// a's forward transform, enqueued right after a's decompose so it runs while
+// b is still on its way in.
+void launch_ntt_a(State& s) {
     const rns::NttGeom& g = s.g;
     const dim3 cols(1u << (g.logS - g.logC), s.t.K);
     const dim3 rows(s.t.N / g.T, s.t.K);
-    if (g.logR) k_ntt_cols<true><<<cols, kThreads, 0, s.comp>>>(s.d_A, s.d_B, s.t, g);
-    k_ntt_rows_mul<<<rows, kThreads, 0, s.comp>>>(s.d_A, s.d_B, s.t, g);
+    if (g.logR) k_ntt_cols<true><<<cols, kThreads, 0, s.comp>>>(s.d_A, nullptr, s.t, g);
+    k_ntt_rows_fwd<<<rows, kThreads, 0, s.comp>>>(s.d_A, s.t, g);
+}
+
+// The rest, once b is decomposed: b's forward transform, the product, the inverse.
+void launch_ntt_rest(State& s) {
+    const rns::NttGeom& g = s.g;
+    const dim3 cols(1u << (g.logS - g.logC), s.t.K);
+    const dim3 rows(s.t.N / g.T, s.t.K);
+    if (g.logR) k_ntt_cols<true><<<cols, kThreads, 0, s.comp>>>(s.d_B, nullptr, s.t, g);
+    k_ntt_rows_mul<true><<<rows, kThreads, 0, s.comp>>>(s.d_A, s.d_B, s.t, g);
     if (g.logR) k_ntt_cols<false><<<cols, kThreads, 0, s.comp>>>(s.d_A, nullptr, s.t, g);
 }
 
@@ -685,11 +721,12 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
         }
     };
     send(in.a.data.data(), s->h_a, s->m_a, s->d_la, s->d_A, s->a_chunks, s->in_a);
+    launch_ntt_a(*s);
     send(in.b.data.data(), s->h_b, s->m_b, s->d_lb, s->d_B, s->b_chunks, s->in_b);
     t[1] = HostClock::now();
     if (s->profile) cudaEventRecord(s->prof[1], s->comp);
 
-    launch_ntt(*s);
+    launch_ntt_rest(*s);
     if (s->profile) cudaEventRecord(s->prof[2], s->comp);
 
     // Out: each chunk's CRT, then its copy back once the CRT is done.
