@@ -15,8 +15,17 @@
 //   FHERMA_OUT=staged|register  how c comes back                     [staged]
 //     staged:   memcpy through pinned buffers allocated at init, chunk by chunk
 //     register: cudaHostRegister the caller's vectors for the call, DMA directly
-//   FHERMA_CHUNKS=n             pipeline depth                       [2]
+//     mapped:   memcpy through the same pinned buffers, mapped into the device:
+//               decompose reads its limbs from host memory over PCIe and CRT
+//               writes its limbs there, with no copy, event or stream hop per
+//               chunk (each costs ~25 us of API calls on rst-goose)
+//   FHERMA_CHUNKS=n             pipeline depth, input side           [2]
+//   FHERMA_OUT_CHUNKS=n         pipeline depth, output side          [FHERMA_CHUNKS]
 //   FHERMA_THREADS=n            host threads for the staged memcpys   [min(16, cores / 2)]
+//   FHERMA_SPIN_MS=n            copy threads keep spinning n ms after a call [20]
+//     Waking sleeping threads costs ~150-200 us per call on rst-goose, and
+//     main.cpp leaves ~13 ms between calls; 20 hides the wake-up (~11 % of a
+//     call) at the price of the workers busy-waiting through that gap.
 //   FHERMA_PROFILE=1            per-phase GPU times on stderr, every call
 //
 // Host side of a staged call: each input chunk is copied into pinned memory by
@@ -182,13 +191,14 @@ k_crt(const uint32_t* __restrict__ Y, uint32_t* __restrict__ c,
 // ---------------------------------------------------------------------------
 // Host side.
 
-enum class Copy { staged, registered };
+enum class Copy { staged, registered, mapped };
 
 Copy copy_mode(const char* var) {
     const char* v = std::getenv(var);
     if (!v || !std::strcmp(v, "staged")) return Copy::staged;
     if (!std::strcmp(v, "register")) return Copy::registered;
-    throw std::runtime_error(std::string(var) + " must be staged or register");
+    if (!std::strcmp(v, "mapped")) return Copy::mapped;
+    throw std::runtime_error(std::string(var) + " must be staged, register or mapped");
 }
 
 // memcpy split into 64 KB pieces that the calling thread and a few workers
@@ -207,7 +217,7 @@ Copy copy_mode(const char* var) {
 // change, so no worker is ever inside a piece when they do.
 class CopyPool {
 public:
-    explicit CopyPool(int workers) {
+    CopyPool(int workers, int spin_ms) : spin_(std::chrono::milliseconds(spin_ms)) {
         for (int w = 0; w < workers; ++w) threads_.emplace_back([this] { work(); });
     }
     ~CopyPool() {
@@ -226,7 +236,10 @@ public:
         }
         cv_.notify_all();
     }
-    void rest() { awake_.store(false); }
+    void rest() {
+        rested_.store(Clock::now().time_since_epoch().count());
+        awake_.store(false);
+    }
 
     void copy(void* dst, const void* src, size_t n) {
         if (threads_.empty() || n <= kPiece) {
@@ -254,6 +267,7 @@ public:
     }
 
 private:
+    using Clock = std::chrono::steady_clock;
     static constexpr size_t kPiece = 64 << 10;
     static constexpr uint64_t kClosed = 0xffffffffu;
 
@@ -283,7 +297,7 @@ private:
         for (;;) {
             if (claim()) continue;
             if (quit_.load()) return;
-            if (awake_.load()) {
+            if (awake_.load() || Clock::now() < Clock::time_point(Clock::duration(rested_.load())) + spin_) {
                 pause();
                 continue;
             }
@@ -293,6 +307,8 @@ private:
         }
     }
 
+    const Clock::duration spin_;
+    std::atomic<Clock::rep> rested_{0};
     std::vector<std::thread> threads_;
     std::mutex m_;
     std::condition_variable cv_;
@@ -320,9 +336,11 @@ struct State {
     uint32_t *d_la = nullptr, *d_lb = nullptr, *d_c = nullptr;   // N x L limbs
     uint32_t *d_A = nullptr, *d_B = nullptr;                     // K x N residues
     uint32_t *h_a = nullptr, *h_b = nullptr, *h_c = nullptr;     // pinned staging
+    uint32_t *m_a = nullptr, *m_b = nullptr, *m_c = nullptr;     // the same, as the device sees them
 
     cudaStream_t comp = nullptr, h2d = nullptr, d2h = nullptr;
-    uint32_t chunk = 0, chunks = 0;
+    uint32_t chunk = 0, chunks = 0;           // input side
+    uint32_t ochunk = 0, ochunks = 0;         // output side
     std::vector<cudaEvent_t> in_a, in_b, crt_done, out_done;
     Copy in_mode = Copy::staged, out_mode = Copy::staged;
     std::unique_ptr<CopyPool> pool;
@@ -374,11 +392,11 @@ void launch_ntt(State& s) {
     if (g.logR) k_ntt_cols<false><<<cols, kThreads, 0, s.comp>>>(s.d_A, nullptr, s.t, g);
 }
 
-void launch_crt(State& s, uint32_t k0, uint32_t count) {
+void launch_crt(State& s, uint32_t* c, uint32_t k0, uint32_t count) {
     const uint32_t blocks = (count + rns::kCrtTile - 1) / rns::kCrtTile;
     rns::with_L(s.t.L, [&](auto Lc) {
         constexpr int L = decltype(Lc)::value;
-        k_crt<L><<<blocks, kCrtThreads, 0, s.comp>>>(s.d_A, s.d_c, k0, count, s.t.N, s.crt);
+        k_crt<L><<<blocks, kCrtThreads, 0, s.comp>>>(s.d_A, c, k0, count, s.t.N, s.crt);
     });
 }
 
@@ -414,7 +432,8 @@ void* fherma_init(const fherma::Point& p) {
         s->in_mode = copy_mode("FHERMA_IN");
         s->out_mode = copy_mode("FHERMA_OUT");
         s->profile = std::getenv("FHERMA_PROFILE") != nullptr;
-        s->pool.reset(new CopyPool(copy_threads() - 1));
+        const char* spin = std::getenv("FHERMA_SPIN_MS");
+        s->pool.reset(new CopyPool(copy_threads() - 1, spin ? std::max(0, std::atoi(spin)) : 20));
 
         s->t = rns::Tables{pl.K, pl.L, pl.N,
                            upload(*s, pl.p), upload(*s, pl.pneg),
@@ -432,24 +451,32 @@ void* fherma_init(const fherma::Point& p) {
         s->d_c = device_alloc<uint32_t>(*s, words);
         s->d_A = device_alloc<uint32_t>(*s, residues);
         s->d_B = device_alloc<uint32_t>(*s, residues);
-        check(cudaMallocHost(&s->h_a, words * sizeof(uint32_t)), "pinned a");
-        check(cudaMallocHost(&s->h_b, words * sizeof(uint32_t)), "pinned b");
-        check(cudaMallocHost(&s->h_c, words * sizeof(uint32_t)), "pinned c");
+        for (auto hm : {std::make_pair(&s->h_a, &s->m_a), std::make_pair(&s->h_b, &s->m_b),
+                        std::make_pair(&s->h_c, &s->m_c)}) {
+            check(cudaHostAlloc(reinterpret_cast<void**>(hm.first), words * sizeof(uint32_t),
+                                cudaHostAllocMapped), "pinned");
+            check(cudaHostGetDevicePointer(reinterpret_cast<void**>(hm.second), *hm.first, 0), "mapped");
+        }
 
         check(cudaStreamCreateWithFlags(&s->comp, cudaStreamNonBlocking), "stream");
         check(cudaStreamCreateWithFlags(&s->h2d, cudaStreamNonBlocking), "stream");
         check(cudaStreamCreateWithFlags(&s->d2h, cudaStreamNonBlocking), "stream");
 
         // Chunks start on multiples of both block tiles.
-        const char* env_chunks = std::getenv("FHERMA_CHUNKS");
-        const uint32_t want = std::max(1, env_chunks ? std::atoi(env_chunks) : 2);
-        const uint32_t align = std::max(rns::kDecTile, rns::kCrtTile);
-        s->chunk = (pl.N + want - 1) / want;
-        s->chunk = (s->chunk + align - 1) / align * align;
-        s->chunk = std::min(s->chunk, pl.N);
-        s->chunks = (pl.N + s->chunk - 1) / s->chunk;
+        auto split = [&](const char* var, uint32_t fallback, uint32_t& chunk, uint32_t& chunks) {
+            const char* env = std::getenv(var);
+            const uint32_t want = std::max(1, env ? std::atoi(env) : static_cast<int>(fallback));
+            const uint32_t align = std::max(rns::kDecTile, rns::kCrtTile);
+            chunk = (pl.N + want - 1) / want;
+            chunk = (chunk + align - 1) / align * align;
+            chunk = std::min(chunk, pl.N);
+            chunks = (pl.N + chunk - 1) / chunk;
+        };
+        split("FHERMA_CHUNKS", 2, s->chunk, s->chunks);
+        split("FHERMA_OUT_CHUNKS", s->chunks, s->ochunk, s->ochunks);
+        for (auto* evs : {&s->in_a, &s->in_b}) evs->resize(s->chunks);
+        for (auto* evs : {&s->crt_done, &s->out_done}) evs->resize(s->ochunks);
         for (auto* evs : {&s->in_a, &s->in_b, &s->crt_done, &s->out_done}) {
-            evs->resize(s->chunks);
             for (auto& e : *evs) check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event");
         }
         for (auto& e : s->prof) check(cudaEventCreate(&e), "event");
@@ -485,6 +512,8 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
 
     const bool reg_in = s->in_mode == Copy::registered;
     const bool reg_out = s->out_mode == Copy::registered;
+    const bool map_in = s->in_mode == Copy::mapped;
+    const bool map_out = s->out_mode == Copy::mapped;
     std::vector<std::unique_ptr<Registration>> hold;
     if (reg_in) {
         hold.emplace_back(new Registration(in.a.data.data(), bytes));
@@ -505,13 +534,20 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     if (s->profile) cudaEventRecord(s->prof[0], s->comp);
 
     // In: each chunk's copy, then its decompose once the copy has landed.
-    auto send = [&](const uint32_t* src, uint32_t* pin, uint32_t* d_limbs, uint32_t* d_res,
-                    std::vector<cudaEvent_t>& landed) {
+    // Mapped: the decompose reads the pinned buffer itself; the launch comes
+    // after the host's writes, which is all the ordering it needs.
+    auto send = [&](const uint32_t* src, uint32_t* pin, uint32_t* mapped, uint32_t* d_limbs,
+                    uint32_t* d_res, std::vector<cudaEvent_t>& landed) {
         for (uint32_t ch = 0; ch < s->chunks; ++ch) {
             const uint32_t k0 = ch * s->chunk;
             const uint32_t count = std::min(s->chunk, N - k0);
             const size_t off = static_cast<size_t>(k0) * L;
             const size_t n = static_cast<size_t>(count) * L * sizeof(uint32_t);
+            if (map_in) {
+                s->pool->copy(pin + off, src + off, n);
+                launch_decompose(*s, mapped, d_res, k0, count);
+                continue;
+            }
             const uint32_t* from = src + off;
             if (!reg_in) {
                 s->pool->copy(pin + off, src + off, n);
@@ -523,8 +559,8 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
             launch_decompose(*s, d_limbs, d_res, k0, count);
         }
     };
-    send(in.a.data.data(), s->h_a, s->d_la, s->d_A, s->in_a);
-    send(in.b.data.data(), s->h_b, s->d_lb, s->d_B, s->in_b);
+    send(in.a.data.data(), s->h_a, s->m_a, s->d_la, s->d_A, s->in_a);
+    send(in.b.data.data(), s->h_b, s->m_b, s->d_lb, s->d_B, s->in_b);
     t[1] = HostClock::now();
     if (s->profile) cudaEventRecord(s->prof[1], s->comp);
 
@@ -532,12 +568,18 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     if (s->profile) cudaEventRecord(s->prof[2], s->comp);
 
     // Out: each chunk's CRT, then its copy back once the CRT is done.
+    // Mapped: the CRT writes the pinned buffer itself, and its end is the copy's.
     uint32_t* dst = reg_out ? out.c.data.data() : s->h_c;
-    for (uint32_t ch = 0; ch < s->chunks; ++ch) {
-        const uint32_t k0 = ch * s->chunk;
-        const uint32_t count = std::min(s->chunk, N - k0);
+    for (uint32_t ch = 0; ch < s->ochunks; ++ch) {
+        const uint32_t k0 = ch * s->ochunk;
+        const uint32_t count = std::min(s->ochunk, N - k0);
         const size_t off = static_cast<size_t>(k0) * L;
-        launch_crt(*s, k0, count);
+        if (map_out) {
+            launch_crt(*s, s->m_c, k0, count);
+            check(cudaEventRecord(s->out_done[ch], s->comp), "event");
+            continue;
+        }
+        launch_crt(*s, s->d_c, k0, count);
         check(cudaEventRecord(s->crt_done[ch], s->comp), "event");
         check(cudaStreamWaitEvent(s->d2h, s->crt_done[ch], 0), "wait");
         check(cudaMemcpyAsync(dst + off, s->d_c + off, static_cast<size_t>(count) * L * sizeof(uint32_t),
@@ -554,9 +596,9 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
         // Everything is enqueued: size the answer while the GPU works.
         out.c.data.resize(words);
         t[3] = HostClock::now();
-        for (uint32_t ch = 0; ch < s->chunks; ++ch) {
-            const size_t off = static_cast<size_t>(ch) * s->chunk * L;
-            const size_t n = std::min(static_cast<size_t>(s->chunk) * L, words - off);
+        for (uint32_t ch = 0; ch < s->ochunks; ++ch) {
+            const size_t off = static_cast<size_t>(ch) * s->ochunk * L;
+            const size_t n = std::min(static_cast<size_t>(s->ochunk) * L, words - off);
             check(cudaEventSynchronize(s->out_done[ch]), "copy out");
             s->pool->copy(out.c.data.data() + off, s->h_c + off, n * sizeof(uint32_t));
         }
@@ -565,7 +607,7 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     t[4] = HostClock::now();
     if (reg_out) t[3] = t[2];
     if (s->profile) {
-        check(cudaStreamWaitEvent(s->comp, s->out_done[s->chunks - 1], 0), "wait");
+        check(cudaStreamWaitEvent(s->comp, s->out_done[s->ochunks - 1], 0), "wait");
         cudaEventRecord(s->prof[4], s->comp);
         cudaEventSynchronize(s->prof[4]);
         report_profile(*s, t);
