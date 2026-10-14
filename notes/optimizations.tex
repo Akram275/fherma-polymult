@@ -1,0 +1,800 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{tikz}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{url}
+\newcommand{\code}[1]{\texttt{\hyphenchar\font=`\-\relax #1}}
+
+\sisetup{detect-all}
+\newcommand{\us}[1]{\SI{#1}{\micro\second}}
+\newcommand{\ms}[1]{\SI{#1}{\milli\second}}
+\newcommand{\MB}[1]{\SI{#1}{\mega\byte}}
+\newcommand{\bitrev}{\operatorname{bitrev}}
+
+\lstset{basicstyle=\ttfamily\small, columns=fullflexible, keepspaces=true,
+        frame=single, framesep=4pt, xleftmargin=6pt, xrightmargin=6pt}
+
+\title{Exact negacyclic polynomial multiplication on the GPU:\\
+       the optimizations behind \code{fherma-polymul}}
+\author{Working notes}
+\date{14 October 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+These notes document the optimization work on our entry to the FHERMA challenge
+\emph{Polynomial Multiplication (GPU-Accelerated)}, which asks for the exact
+product $c = a\cdot b \bmod (X^N+1,\, q)$ of two polynomials with coefficients
+of up to a few thousand bits. The solution uses a residue number system (RNS),
+a negacyclic number-theoretic transform (NTT) per residue prime, and a Chinese
+remainder (CRT) reconstruction. For each optimization we give the problem, how
+it was diagnosed, what was changed and what it measured, including the changes
+that did not help. At the benchmark point $N = 32768$, $W = 868$ the time per
+multiplication on our development machine went from \ms{3.07} to \us{700}; the
+code was then generalized to the point $N = 65536$, $W = 1747$ that now decides
+the ranking, where it first took \ms{3.09}; kernel fixes brought it to \ms{2.6}, and
+reading and writing the caller's memory directly through HMM to about \ms{2.3}
+(Point \#2: about \us{610}).
+\end{abstract}
+
+\tableofcontents
+
+%======================================================================
+\section{The problem and how it is scored}
+
+\paragraph{Specification.} The kernel
+\code{polynomial-multiplication/negacyclic@1.0.0} computes, for two polynomials $a, b$ of degree $< N$ with coefficients in $[0,q)$,
+\[
+  c \;=\; a \cdot b \bmod (X^N + 1,\; q),
+\]
+exactly, with every output coefficient canonical in $[0, q)$. $N$ is a power of two;
+$q$ is the largest prime below $2^W$ with $q \equiv 1 \pmod{2N}$. A coefficient is
+stored as $L = \lceil W/32 \rceil$ little-endian 32-bit limbs, so an operand is an
+$N \times L$ array of \code{u32}. The specification sets no upper bound on $N$ or $W$
+and lists five points: $(N,W) = (64,32)$, $(1024,512)$, $(8192,256)$, $(32768,868)$
+and $(65536,1747)$.
+
+\paragraph{Scoring.} The score is the median wall-clock time of one call of
+\code{fherma\_run}, measured from the moment $a$ and $b$ are available in host
+memory to the moment $c$ is complete in host memory. \emph{Copies to and from the
+GPU are therefore inside the timed window.} Setup (\code{fherma\_init}) is not
+timed but may depend only on $N$, $W$, $L$ and $q$. Results must be exact; FHERMA
+re-tests on 20 random seeds per point and on non-public inputs.
+
+\paragraph{Benchmark points.} Since 28 September 2026 the ranking is decided at
+\textbf{Point \#1}, $N = 65536$, $W = 1747$, $L = 55$; the original point,
+$N = 32768$, $W = 868$, $L = 28$, is now \textbf{Point \#2} and is shown beside it.
+An entry with no Point \#1 result ranks behind every entry that has one.
+
+\paragraph{Hardware.} All measurements in these notes come from our development
+machine, a shared QEMU virtual machine with 96 virtual CPUs (x86-64-v2, no AVX) and
+two NVIDIA L40S cards (\code{sm\_89}, \SI{46}{\giga\byte}, PCIe Gen4 x16). The
+ranked runs use an NVIDIA RTX PRO 6000 (\code{fherma-gpu-rtx6000}), a different
+architecture with a faster PCIe link, so absolute times are not comparable; the
+relative effects of host-side changes in particular may differ there.
+
+\paragraph{Data volume.} At Point \#2 an operand is $32768 \times 28 \times 4$ bytes
+$=$ \MB{3.67}, so each call moves \MB{11} across PCIe (two operands in, one out);
+at Point \#1 an operand is \MB{14.4} and a call moves \MB{43}. On our Gen4 link,
+pinned DMA runs at about \SI{24.5}{\giga\byte\per\second}, which puts a floor of
+roughly \us{450} under Point \#2 and \ms{1.75} under Point \#1 before any compute.
+
+%======================================================================
+\section{Algorithm}
+
+\subsection{Residue number system}
+Choose $K$ primes $p_j < 2^{31}$ with $p_j \equiv 1 \pmod{2N}$ (so that each has a
+primitive $2N$-th root of unity $\psi_j$), and let $P = \prod_j p_j$. The integer
+(not reduced) negacyclic product $\tilde c = \sum_{i+k=n} a_i b_k - \sum_{i+k=n+N} a_i b_k$
+satisfies $|\tilde c_n| < N q^2$. If $P > 2^{20} \cdot 2N q^2$, then $\tilde c$ is
+determined by its residues modulo the $p_j$, with a margin of 20 bits that makes the
+floating-point rounding below exact. The number of primes needed is
+\[
+  K \approx \frac{2W + \log_2 N + 1 + 20}{31},
+\]
+which gives $K = 58$ at Point \#2 and $K = 115$ at Point \#1. The primes are taken
+from just below $2^{31}$ downwards in steps of $\max(2N, 2^{16})$; all of them lie
+above $2^{30.8}$.
+
+\subsection{Pipeline}
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Decompose.} Each coefficient's $L$ limbs become its residue modulo each
+  prime: $x \bmod p = \sum_{l} x_l \cdot (2^{32l} \bmod p) \bmod p$, with the
+  constants $2^{32l} \bmod p$ precomputed (with Shoup companions,
+  \S\ref{sec:shoup}). Output: two $K \times N$ arrays of residues.
+\item \textbf{Forward NTT} per prime, Cooley--Tukey, with twiddles
+  $\psi^{\bitrev(i)}$ so that the negacyclic twist is folded into the transform and
+  no pre- or post-multiplication by powers of $\psi$ is needed.
+\item \textbf{Pointwise product} in the NTT domain, multiplied by the constant
+  $N^{-1} \cdot (P/p_j)^{-1}$, so that the inverse transform directly yields
+  $y_j = \tilde c \cdot (P/p_j)^{-1} \bmod p_j$.
+\item \textbf{Inverse NTT} per prime, Gentleman--Sande, natural order out.
+\item \textbf{CRT.} With $v = \operatorname{round}\big(\sum_j y_j / p_j\big)$,
+  computed in double precision, the centred value is
+  $\tilde c = \sum_j y_j (P/p_j) - vP$, and modulo $q$
+  \[
+    c \;=\; \sum_j y_j \cdot M_j \;+\; (-vP \bmod q) \pmod q,
+    \qquad M_j = (P/p_j) \bmod q,
+  \]
+  where both $M_j$ and the $K+1$ possible values of $-vP \bmod q$ are precomputed.
+  The final reduction modulo $q$ uses a quotient estimated in double precision from
+  the top limbs, followed by at most two subtractions.
+\end{enumerate}
+
+\subsection{Modular arithmetic}\label{sec:shoup}
+All residue arithmetic is on 32-bit words with $p < 2^{31}$, so a lazily reduced
+value below $2p$ still fits in a word.
+\begin{itemize}[leftmargin=*]
+\item \textbf{Shoup multiplication} by a constant $w$: with the precomputed
+  companion $w' = \lfloor w \cdot 2^{32} / p \rfloor$,
+  $r = a w - \lfloor a w' / 2^{32} \rfloor \cdot p \pmod{2^{32}}$ lies in $[0, 2p)$
+  for any 32-bit $a$; one conditional subtraction finishes it. Three integer
+  multiplies, no 64-bit product.
+\item \textbf{Montgomery multiplication} $\operatorname{mont}(a,b) = a b \cdot 2^{-32} \bmod p$
+  for the pointwise product of two variables.
+\end{itemize}
+
+\subsection{GPU schedule}
+\begin{itemize}[leftmargin=*]
+\item \textbf{Four-step NTT split.} The $\log_2 N$ stages are split at row length
+  $S = 2^{\lceil \log_2 N / 2 \rceil}$: stages whose butterflies span a distance
+  $\ge S$ pair elements of the same column (stride $S$), the others pair elements
+  within a contiguous row. Each pass keeps a tile of $T = 2048$ residues in shared
+  memory for all its stages. At $N = 32768$: $S = 256$, $R = N/S = 128$, and a
+  column-pass block holds $C = T/R = 16$ columns.
+\item \textbf{Kernels per call.} \code{k\_decompose} (per input chunk),
+  \code{k\_ntt\_cols} and \code{k\_ntt\_rows\_fwd} on $a$, \code{k\_ntt\_cols} on $b$,
+  \code{k\_ntt\_rows\_mul} (forward rows of $b$, pointwise product, inverse rows),
+  \code{k\_ntt\_cols} (inverse), and \code{k\_crt} (per output chunk).
+\item \textbf{Streams.} Host-to-device copies run on one stream, kernels on a
+  second, device-to-host copies on a third, chained by events, so that copying
+  chunk $i+1$ overlaps decomposing chunk $i$, and copying output chunk $i$ overlaps
+  the CRT of chunk $i+1$.
+\item \textbf{Shared schedule.} Tile geometry, index maps and per-phase steps live in
+  one header used by both the GPU kernels and a CPU emulation, which runs the same
+  schedule block by block and phase by phase and checks that no NTT stage touches
+  an element twice. The CPU build therefore tests the GPU's indexing, not just its
+  arithmetic.
+\end{itemize}
+
+%======================================================================
+\section{How we measured}
+
+\paragraph{Correctness.} Every change was checked with \code{run\_tests.sh}, which
+generates test points with Python oracles (an exact $O(N^2)$ reference for small $N$,
+a GMP Kronecker-substitution reference for large $N$) and verifies the outputs
+bit for bit. The matrix now has 21 points: every NTT geometry, every limb edge
+($L = 1$, $q$ filling its limbs, $q$ one bit into a new limb, $L = 64$), the five
+points of the specification, $N = 2^{17}$, and an all-$(q-1)$ worst case in
+case 0 of each large point. Both the CPU build and the GPU build run it. NVIDIA's
+\code{compute-sanitizer} (memcheck, racecheck, synccheck) was run after every
+kernel change.
+
+\paragraph{Fuzzing.} \code{fuzz.py} adds 61 more points (every 32-bit width boundary up
+to 2048, $N$ from 2 to $2^{22}$, 30 random sizes) with six adversarial input patterns
+each (all $q-1$, random, zero, the $x^{N-1}\cdot x^{N-1}$ wrap, the identity, alternating),
+under every copy mode and twiddle path and on the CPU build, against a GMP reference
+that is itself checked against the schoolbook product for small $N$: no failures.
+Out-of-range sizes are refused with a message.
+
+\paragraph{Performance.} The development server is shared, and other users' jobs
+moved wall-clock medians by \us{50} or more, with outliers up to \ms{1.3}. Three
+practices made the measurements usable:
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Interleaved A/B runs}: alternate the builds or settings being compared
+  over 5--20 rounds of 21 cases, and compare medians and lower quartiles of the
+  per-round medians.
+\item \textbf{Kernel times and the GPU span from Nsight Systems}: the duration of each
+  kernel and the span from a call's first transfer to its last are almost
+  unaffected by host noise.
+\item \textbf{Elimination}: build scratch variants that skip one part of a kernel
+  (the stores, the arithmetic, the table loads) and attribute the time by difference.
+  Combined with instruction counts from the SASS (\code{cuobjdump}), this found
+  the real bottleneck every time our first guess was wrong.
+\end{enumerate}
+
+%======================================================================
+\section{Optimizations}
+
+Unless stated otherwise, numbers are for Point \#2. Each subsection gives the
+problem, the diagnosis, the change and the measured effect.
+
+\subsection{CRT: from one thread per coefficient to prime groups}
+
+\paragraph{Problem.} The CRT kernel took \us{47} in one launch over all 32768
+coefficients, but about \us{38} per launch \emph{regardless of launch size} when
+the output was split into chunks, so the default 8 chunks cost \us{308}. One
+coefficient was handled by one thread, in blocks of 64 threads: a chunk of 4096
+coefficients was 64 blocks of two warps on a 142-SM GPU.
+
+\paragraph{Diagnosis.} Removing each part of the kernel in turn gave, per chunk:
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+part of \code{k\_crt} & cost per chunk \\
+\midrule
+products ($58 \times 28$ multiply-accumulates) & \us{13.5} \\
+loading $Y$, storing $c$, launch & \us{12} \\
+rounding estimate $\sum_j y_j/p_j$ & \us{2.3} \\
+final reduction modulo $q$ & \us{2} \\
+\bottomrule
+\end{tabular}
+\end{center}
+No single part was slow: every phase was waiting on latency, because there was far
+too little parallel work per launch.
+
+\paragraph{Change.} (1) Each block first stages its tile of $Y$ ($K$ residues for
+each of its coefficients) into shared memory in one coalesced pass, with all loads
+in flight together. (2) The $K$ primes are split into 4 groups, and each coefficient
+gets 4 threads, each computing a partial sum over its group, carried down to $L+2$
+words. A last phase adds the 4 partials and $-vP \bmod q$ and reduces modulo $q$.
+Blocks are 32 coefficients $\times$ 4 groups $= 128$ threads; a warp is one prime group
+and 32 consecutive coefficients, so its loads of the table $M$ are uniform.
+
+\paragraph{Result.} \us{308} $\to$ \us{92} at 8 chunks; \us{47} $\to$ \us{38} in one
+launch. The staging step alone (without the groups) gave only
+\us{308} $\to$ \us{232}: latency of global loads was part of the problem, the lack of
+parallelism the larger part. End to end this was worth only 1--2\,\% at the time,
+because the host side dominated (next section).
+
+\subsection{Host side: a copy pool instead of page registration}
+
+\paragraph{Problem.} With the GPU work at about \ms{1.1} of a \ms{2.1} call,
+roughly half the call was spent on the host. The inputs arrive in freshly
+allocated \code{std::vector}s, and the output must be returned as a new vector.
+
+\paragraph{Diagnosis.} A host-only benchmark measured each step for one
+\MB{3.67} operand on this VM:
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+step & median \\
+\midrule
+\code{cudaHostRegister} + unregister of the caller's buffer & \us{400} \\
+\code{memcpy} into a pinned buffer, 1 thread & \us{300} \\
+\code{memcpy} into a pinned buffer, 16 threads (cache-hot) & \us{13} \\
+zero-filling a new output vector (\code{resize}) & \us{237} \\
+pinned DMA, either direction & \us{150} \\
+pageable \code{cudaMemcpy}, either direction & \us{357} \\
+\bottomrule
+\end{tabular}
+\end{center}
+Registering the caller's pages, the fastest mode before, was the most expensive
+way to reach the GPU; one-thread copies through pinned memory were next.
+
+\paragraph{Change.} A pool of \code{std::thread} workers copies each input chunk into
+a pinned staging buffer, then the chunk's DMA and decompose are enqueued. The copy
+is cut into \SI{64}{\kilo\byte} pieces that the caller and the workers claim from a
+shared counter. The counter packs a job number with the piece index and pieces are
+claimed by compare-and-swap, so a late worker can never claim a piece of a newer
+job with an older job's parameters, and the caller never waits for a worker that is
+not awake. The output is copied out of a pinned buffer by the same pool, chunk by
+chunk, as each chunk lands. A first version used static slices per worker; it had a
+shutdown hang (spinning workers never checked the quit flag), found by an
+experiment and fixed.
+
+\paragraph{Result.} \us{2104} $\to$ about \us{880} per call (best setting before
+$\to$ new default), a factor of 2.4.
+
+\subsection{Chunking: fewer, shaped chunks}
+
+\paragraph{Observation.} After the copy pool, more chunks made things \emph{worse}:
+8 input chunks cost about \us{250} more than 2. We first attributed this to about
+\us{25} of CUDA API calls per chunk. That explanation was wrong: with zero-copy
+output (\S\ref{sec:zerocopy}), where a chunk is only one kernel launch and one event,
+extra chunks still hurt. The cost is a fixed overhead per parallel copy in the pool.
+
+\paragraph{Changes and results.}
+\begin{itemize}[leftmargin=*]
+\item Default pipeline depth reduced from 8 chunks to 2.
+\item Input and output chunking were decoupled, and the chunks of each operand can
+  be given relative weights (settings in Appendix~\ref{app:settings}). An output split of $1{:}2{:}1$ lets the first output
+  DMA start after a smaller first CRT chunk and leaves less to copy after the last
+  DMA. Over 10 interleaved rounds: \us{715} $\to$ \us{700} median, lower quartile
+  \us{710} $\to$ \us{695}. Now the default.
+\item Uneven \emph{input} chunks (a small first chunk of $a$, a small last chunk of
+  $b$) did not help; a $3{:}1$ or $7{:}1$ split of $b$ made the GPU span worse
+  (\us{625} and \us{647} against \us{591}--\us{610}), because the larger first chunk
+  delays $b$'s first transfer.
+\end{itemize}
+
+\subsection{Zero-copy decompose and CRT}\label{sec:zerocopy}
+
+\paragraph{Idea.} Map the pinned staging buffers into the device address space so
+that \code{k\_decompose} reads its limbs directly over PCIe and \code{k\_crt} writes
+its limbs directly to host memory, removing the separate DMA, event and stream
+hop of every chunk.
+
+\paragraph{Result.} Over 5 interleaved rounds, mapped input saved about
+\us{15}--\us{20} (2\,\%), well inside the \us{790}--\us{940} spread between rounds.
+Kept as an opt-in mode (\code{FHERMA\_IN/OUT=mapped}); the default stays staged.
+It may behave differently on the reference machine.
+
+\subsection{Worker wake-up: spinning between calls}
+
+\paragraph{Problem.} The copy workers sleep on a condition variable between calls.
+Timing each input copy showed the first copy of a call taking \us{240}--\us{270}
+instead of \us{60}--\us{110}: waking sleeping threads in this VM costs about
+\us{150}--\us{180}. The harness leaves about \ms{13} between calls (it writes the
+previous answer and reads the next inputs from files).
+
+\paragraph{Change.} \code{FHERMA\_SPIN\_MS} (default \SI{20}{\milli\second}): after a
+call, the workers keep spinning for that long before sleeping. A test without the
+\code{pause} instruction in the spin loop (to rule out the hypervisor descheduling
+spinning virtual CPUs) made no difference.
+
+\paragraph{Result.} Over 5 interleaved rounds: \us{860} $\to$ \us{760} (staged) and
+\us{840} $\to$ \us{763} (mapped); every spinning round beat every sleeping round. The
+cost is 15 threads busy-waiting through the gap between calls; whether the grader
+allows that is an open question.
+
+\subsection{Zero-filling the output on a helper thread}
+
+\paragraph{Problem.} The output vector must be sized (\code{resize}, a zero fill
+of about \us{350} here) before chunks can be copied into it. That happened after all
+GPU work was enqueued, about \us{300} into the call, so it ended near \us{660},
+after the first output chunk had landed (about \us{620}): it was on the critical path.
+
+\paragraph{Change.} A dedicated helper thread (spinning and sleeping like the pool)
+zero-fills the output from the start of the call, while the calling thread copies
+the inputs. A guard object waits for it on every exit path, since it writes into
+the vector being returned.
+
+\paragraph{Result.} \us{736} $\to$ \us{708} over 6 interleaved rounds (5 consistent,
+one outlier).
+
+\subsection{Overlapping $a$'s forward NTT with $b$'s transfer}
+
+\paragraph{Problem.} The forward transforms of $a$ and $b$ ran together after $b$ had
+fully arrived, but $a$'s does not need $b$.
+
+\paragraph{Change.} The forward transform of $a$ (column pass and a new row-only
+kernel \code{k\_ntt\_rows\_fwd}) is enqueued right after $a$'s decompose, so it runs
+while $b$ is still crossing PCIe; \code{k\_ntt\_rows\_mul} gained a mode that skips
+$a$'s forward stages. The CPU emulation follows the same order.
+
+\paragraph{Result.} GPU span \us{622} $\to$ \us{591} (median of 21 calls; the minimum
+improved by the same amount). The column pass on $b$ alone also costs less than the
+old pass on both operands (\us{16} against \us{22}).
+
+\subsection{Decompose: register blocking}
+
+\paragraph{Problem.} \code{k\_decompose} took \us{20.6} for half an operand, and the
+last call of it is on the critical path.
+
+\paragraph{Diagnosis.} Two guesses failed first: making $L$ a compile-time constant
+(unrolled loops; \us{19.8}) and lazy reduction (\us{19.4}), so neither latency nor
+arithmetic instruction count was the limit. Elimination showed the arithmetic phase
+was essentially the whole cost (\us{19.4} full, \us{2.8} without the arithmetic,
+\us{19.1} without the stores). The SASS of \code{k\_decompose<28>} showed, per residue,
+58 global loads, 28 shared loads, 101 \code{IMAD} and 37 \code{IADD3}: \textbf{two
+table loads per term}, the two words $2^{32l} \bmod p$ and its Shoup companion,
+reloaded by every thread although a whole warp shares one prime.
+
+\paragraph{Change.}
+\begin{itemize}[leftmargin=*]
+\item \textbf{Register blocking}: each thread computes 4 coefficients for the same
+  prime (lanes take coefficients $\ell, \ell+32, \ell+64, \ell+96$), so each table
+  entry loaded serves 4 terms, and every store is still 32 consecutive coefficients.
+\item \textbf{Lazy reduction}: each term is reduced only to $[0, 2p)$, terms are summed
+  in 64 bits (below $2^{37}$ for $L \le 32$), and the sum $h \cdot 2^{32} + \ell$ is
+  reduced once as $\ell \cdot 1 + h \cdot (2^{32} \bmod p)$, using entries 0 and 1 of
+  the existing table.
+\item \textbf{Block size} 512 threads instead of 256, for enough warps per SM.
+\end{itemize}
+
+\paragraph{Result.}
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+version & time (half operand) \\
+\midrule
+original & \us{20.6} \\
+$L$ templated & \us{19.8} \\
+\quad + lazy reduction & \us{19.4} \\
+\quad + 4 coefficients per thread, 256 threads & \us{15.4} \\
+\quad + 2 coefficients per thread, 512 threads & \us{13.8} \\
+\quad + 4 coefficients per thread, 512 threads & \textbf{\us{12.2}} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{NTT twiddles: one load instead of two}
+
+\paragraph{Diagnosis.} By elimination, \code{k\_ntt\_rows\_mul} (\us{31.8}) split into
+about \us{14} of data movement, \us{8.4} of butterfly arithmetic and \us{9.4} of
+twiddle loads; \code{k\_ntt\_cols} (\us{15.9}) into \us{10.1}, \us{2.5} and \us{3.3}.
+
+\paragraph{Change.} Each twiddle and its Shoup companion are stored side by side
+(\code{struct alignas(8) Twiddle}), so a butterfly fetches both with one 8-byte load.
+
+\paragraph{Result.} Only about \us{1} per kernel (\us{31.8} $\to$ \us{30.8}, \us{15.9}
+$\to$ \us{15.3}). The twiddle cost is bytes, not instructions: a row-pass block needs
+about 2048 distinct twiddles per transform, so \code{k\_ntt\_rows\_mul} reads about
+\MB{30} of twiddles per call from L2. Kept because it is simpler and not slower.
+
+%======================================================================
+\section{Generalizing to Point \#1}
+
+The original code accepted only $N \le 2^{15}$, $L \le 32$ and $K \le 80$, and stopped
+in \code{fherma\_init} at Point \#1. Changes:
+\begin{itemize}[leftmargin=*]
+\item Primes $p \equiv 1 \pmod{\max(2N, 2^{16})}$: the same set as before for
+  $N \le 2^{15}$, a valid set for larger $N$.
+\item $N$ up to $2^{22}$ (beyond that, a row would not fit the 2048-element tile),
+  $L$ up to 64 ($W \le 2048$), $K$ up to 160; anything else is rejected with an
+  explicit message.
+\item The CRT block's shared memory grows with $K$ and $L$ (about \SI{52}{\kilo\byte}
+  at Point \#1) and is now allocated dynamically, with the opt-in attribute set past
+  \SI{48}{\kilo\byte} and a clear error if the device cannot provide it.
+\end{itemize}
+All 21 test points pass on the CPU and the GPU, including Point \#1 with all-$(q-1)$
+inputs, $W = 2048$ against the exact oracle and $N = 2^{17}$; the sanitizers are clean
+at $L = 55$ and $L = 64$. Register allocation shows no spills at $L = 55$.
+
+The submission was also built and run inside FHERMA's challenge image
+\code{fherma/cupqc:0.6.0} (the digest shown on the leaderboard) from a clean copy of
+only the submitted files, with the platform's exact build command: no warnings, all
+points verified, and the same speed as the native build.
+
+%======================================================================
+\section{Optimizations for Point \#1}
+
+At Point \#1 the first working version spent \us{707} in kernels between the last
+input transfer and the first output transfer (against \us{95} at Point \#2), with two
+kernels scaling far worse than the data, which grows by a factor of about 4 ($K$ from 58
+to 115, $N$ doubled):
+\begin{itemize}[leftmargin=*]
+\item \code{k\_ntt\_rows\_mul}: \us{31} $\to$ \us{335}. The full twiddle tables are
+  $16 K N$ bytes $=$ \MB{121}, more than the L40S's \SI{96}{\mega\byte} L2 (and, with the
+  data, than the RTX PRO 6000's \SI{128}{\mega\byte}), so they stream from DRAM.
+\item CRT: \us{12} $\to$ about \us{170} per chunk. Its shared memory had grown to
+  \SI{52}{\kilo\byte} per block, which allows one 4-warp block per SM.
+\end{itemize}
+
+\subsection{Twiddles generated from two small tables}
+
+\paragraph{Idea.} A twiddle with index $i$ is $\psi^{e}$ with $e = \bitrev(i)$.
+Splitting $e = e_h 2^s + e_\ell$ with $s = \lceil \log_2 N / 2 \rceil$,
+\[
+  \psi^{e} = \psi^{e_h 2^s} \cdot \psi^{e_\ell},
+\]
+so two per-prime tables of $2^{\log_2 N - s}$ and $2^s$ entries suffice: 256 + 256 at
+Point \#1, about \SI{0.5}{\mega\byte} for all primes and both directions, against
+\MB{121}. Stored in Montgomery form ($x \cdot 2^{32} \bmod p$), the twiddle is one
+Montgomery product of two table entries,
+$\operatorname{mont}(\psi^{e_h 2^s} 2^{32}, \psi^{e_\ell} 2^{32}) = \psi^e 2^{32}$, and
+applying it is a second one, $\operatorname{mont}(y, \psi^e 2^{32}) = y \psi^e$; no Shoup
+companion is needed.
+
+\paragraph{Implementation.} The butterflies take a \emph{twiddle source} with one
+method, \code{mul(y, i)} $= y \cdot w_i \bmod p$: \code{TableTwiddles} reads the full
+Shoup table, \code{GenTwiddles} builds $w_i$ as above. The row kernels are templated on
+the source. The column pass only ever uses indices below $2^{\lfloor \log_2 N/2 \rfloor}$,
+so it always reads a small head of the full table instead (\SI{235}{\kilo\byte} at
+Point \#1). The full tables are built only when the table path is chosen, which also
+saves \MB{121} of device memory and part of the setup time at Point \#1.
+
+\paragraph{Result.} Kernel times (Nsight Systems):
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+ & \multicolumn{2}{c}{Point \#1} & \multicolumn{2}{c}{Point \#2} \\
+kernel & table & generated & table & generated \\
+\midrule
+\code{k\_ntt\_rows\_mul} & 336 & \textbf{132} & \textbf{31} & 38 \\
+\code{k\_ntt\_rows\_fwd} & 120 & \textbf{64} & \textbf{17} & 20 \\
+\code{k\_ntt\_cols} (head table) & 65 & \textbf{55} & 15 & 15 \\
+\bottomrule
+\end{tabular}
+\end{center}
+(times in \si{\micro\second}). Generated twiddles win when the tables fall out of L2 and
+lose when they fit, so the choice is automatic: generated when $16KN$ exceeds
+\MB{64} (Point \#1), table otherwise (Point \#2), overridable with
+\code{FHERMA\_TWIDDLES}. The test matrix passes on both paths. GPU span at Point \#1:
+\ms{2.58} $\to$ \ms{2.32}.
+
+\subsection{CRT split over limb ranges}
+
+\paragraph{Change.} Instead of splitting each coefficient's sum over groups of primes,
+each of the block's 4 warps owns a range of output limbs: warp $g$ accumulates the 64-bit
+columns of limbs $[g\cdot\textit{span},\, (g+1)\cdot\textit{span})$, with
+$\textit{span} = \lceil L/4 \rceil$, of $\sum_j y_j M_j$ over \emph{all} primes, plus the
+rounding sum $\sum y_j/p_j$ over the primes $j \equiv g \pmod 4$. Lane $i$ takes
+coefficient $i$ of the block, so its $y_j$ loads are 32 consecutive coefficients of one
+prime (coalesced, read straight from global memory) and its loads of $M$ are uniform
+across the warp. Each partial is carried down to $\textit{span}+2$ words; a combine step
+per coefficient adds the 4 partials and $-vP \bmod q$, reduces modulo $q$, and writes the
+result over the same shared-memory row (odd row stride, so no bank conflicts). Shared
+memory no longer depends on $K$: about \SI{10}{\kilo\byte} at $L = 55$ instead of
+\SI{52}{\kilo\byte}.
+
+\paragraph{Tuning.} Kernel time per chunk:
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+variant & Point \#2 & Point \#1 \\
+\midrule
+old: prime groups, $Y$ staged in shared memory & 11.9 & about 170 \\
+limb ranges, 2 coefficients per thread & 31.5 & 53.6 \\
+limb ranges, 1 coefficient per thread & 15.9 & 50.0 \\
+\quad + prime loop unrolled by 4 & \textbf{13.1} & \textbf{50.1} \\
+\quad + unrolled by 8 & 18.3 & 50.3 \\
+\bottomrule
+\end{tabular}
+\end{center}
+(times in \si{\micro\second}). Two coefficients per thread halve the number of blocks,
+and each iteration of the prime loop starts with a global load that has little
+arithmetic to hide behind; unrolling by 4 keeps several of those loads in flight. At
+Point \#2 only the small first chunk is on the critical path, so the \us{1} lost there is
+negligible.
+
+\subsection{Host overhead at Point \#1}
+The wall clock exceeded the GPU span by about \us{580}. The host timeline shows the input
+copies into pinned memory saturating at about \SI{29}{\giga\byte\per\second} (\ms{1} for
+\MB{28.8}) from 16 threads on, about the PCIe rate, so the first transfer waits for the
+whole first chunk (about \us{265}), and the last output chunk is copied out after the last
+transfer. Nothing tried helped measurably:
+\begin{itemize}[leftmargin=*]
+\item more copy threads (24, 32, 48): copy time unchanged;
+\item seven chunk shapes, including a small first chunk of $a$ and small last output
+  chunks: all within \ms{2.60}--\ms{2.81}, inside the noise;
+\item starting the output zero-fill only after the first input chunk, to free memory
+  bandwidth for it: worse (\ms{2.69} $\to$ \ms{3.08}), the fill then lands on the critical path.
+\end{itemize}
+On this VM the host side is bound by memory bandwidth; it may well be less so on the
+reference machine.
+
+\subsection{A container-only slowdown}
+Built and run inside FHERMA's image, Point \#1 is 0.3--\ms{1} slower than natively (Point
+\#2 only about \us{50}). The host timeline inside the container shows the helper's zero-fill
+of the \MB{14.4} output vector taking about \ms{3} instead of \ms{1.3}. Page faults are the
+same in both. The image's glibc 2.39 zero-fills blocks above \SI{2}{\kilo\byte} with
+\code{rep stosb}, while the host's glibc 2.43 uses non-temporal stores above
+\SI{256}{\kilo\byte}; this VM's CPU model advertises neither ERMS nor FSRM, the features
+that make \code{rep stosb} fast. The slowdown is therefore probably specific to our VM;
+a fix that does not depend on the C library would be to zero-fill the next call's output
+vector in the background between calls, which moves work out of the timed window and is
+not done.
+
+%======================================================================
+\section{Getting closer to the transfer floor}
+
+Every output coefficient depends on every input coefficient, so the output cannot start
+before the whole input has arrived: the floor is the input transfer plus the output
+transfer. At Point \#1 the wall clock (\ms{2.6}) exceeded that floor (\ms{1.8} on our
+Gen4 link) by about \us{400}--\us{500} of host copies at the edges of the call and
+\us{370} of kernels between the last input byte and the first output byte.
+
+\subsection{Reading and writing the caller's memory through HMM}
+The driver here runs in HMM mode (heterogeneous memory management: GPU kernels can access
+ordinary pageable host memory). With the advice ``preferred location: host, accessed by:
+GPU'' (\code{cudaMemAdvise}), a kernel reads or writes a pageable buffer over PCIe without
+migrating its pages:
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+14.4 MB (one Point \#1 operand) & time & rate \\
+\midrule
+pinned DMA (reference) & \us{593} & \SI{24.3}{\giga\byte\per\second} \\
+kernel reads the pageable vector, no advice (pages migrate) & \ms{32} & \SI{0.4}{\giga\byte\per\second} \\
+kernel reads it, advised to stay in host memory & \us{684} & \SI{21.1}{\giga\byte\per\second} \\
+prefetch (migrate) to the GPU, then read & \ms{6.3} & \SI{2.3}{\giga\byte\per\second} \\
+kernel writes a pageable vector, advised to stay in host memory & \us{732} & \SI{19.7}{\giga\byte\per\second} \\
+previous output path (DMA, then one-thread copy) & \ms{2.8} & \SI{5.1}{\giga\byte\per\second} \\
+\bottomrule
+\end{tabular}
+\end{center}
+So in the new default mode (\code{hmm}) the decompose kernel reads the limbs straight from
+the caller's input vectors, and the CRT writes the result straight into the output vector
+(after the helper's zero-fill): there are no host staging copies at all. The output stays
+in host memory, so nothing is deferred past the end of the call. Where the device cannot
+access pageable memory the code falls back to the staged path.
+
+Two consequences followed. First, in this mode $b$'s decompose kernels \emph{are} $b$'s
+transfer, so $a$'s forward NTT moved to its own stream, with lower priority than the
+decompose stream (otherwise $b$'s first decompose started \us{46} late, behind the NTT's
+blocks). Second, the decompose kernel now loads 16 bytes at a time for full blocks, which
+raised its read rate from \SI{18.4}{} to about \SI{20}{\giga\byte\per\second}.
+
+\subsection{Chunking in HMM mode}
+With no host copy to overlap, every chunk boundary only leaves the end of a kernel
+underusing the GPU, and here the kernels are the transfers. GPU span at Point \#1:
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+input chunks / output chunks & GPU span \\
+\midrule
+2 / $1{:}2{:}1$ (staged defaults) & \us{2404} \\
+8 / $1{:}2{:}1$ & \us{2705} \\
+1 / $1{:}2{:}1$ & \us{2323} \\
+2 / 1 & \us{2304} \\
+\textbf{1 / 1} & \textbf{\us{2242}} \\
+\bottomrule
+\end{tabular}
+\end{center}
+One chunk each way is the default in \code{hmm} mode.
+
+\paragraph{Result.} Interleaved medians, native: Point \#1 \us{2616} $\to$ about \us{2300};
+Point \#2 \us{684} $\to$ about \us{610}. Host overhead fell from about \us{400}--\us{500} to
+about \us{60} at Point \#1. All 21 test points pass in every copy mode; sanitizers clean.
+
+\subsection{Tried and not adopted}
+\begin{itemize}[leftmargin=*]
+\item \textbf{A pinned memory pool behind a replaced global \code{operator new}}, so that the
+  harness's own input and output vectors would be pinned and DMA-able at the full
+  \SI{24.5}{\giga\byte\per\second}. Built only as a scratch experiment: it deadlocked inside the
+  CUDA runtime, even with a re-entrancy guard and with the pool enabled only after
+  initialization. It would also change how the harness allocates its buffers, so it would need
+  FHERMA's approval. Expected gain over \code{hmm}: the DMA-versus-HMM rate difference, about
+  \us{250}--\us{300} at Point \#1.
+\item \textbf{A single-pass NTT per prime using thread-block clusters} (distributed shared memory),
+  which would cut the memory passes after the last input byte from three to one. Clusters need
+  \code{sm\_90} or newer; the L40S cannot run them, so this was not attempted.
+\item \textbf{A measurement on FHERMA's hardware}: it requires pushing the code to a repository and
+  registering the commit from the participant's account.
+\end{itemize}
+
+\subsection{The zero-fill inside the challenge image}
+Inside \code{fherma/cupqc:0.6.0} on this VM, every mode waits on the output vector's
+zero-fill, which takes 1.5--\ms{2.9} there depending on load, against about \ms{1.3}
+natively (the image's glibc 2.39 \code{memset} against the host's 2.43). In \code{hmm}
+output mode the CRT has to wait for it, so measured in the image (three rounds) the modes
+overlap: staged \ms{3.1}--\ms{3.7}, \code{hmm} 2.5--\ms{3.6}. This is probably specific to
+our VM's old CPU model, but it is unverified for FHERMA's machine. The only complete fix
+found, preparing the next call's zeroed output vector between calls, moves work out of the
+timed window and is not done.
+
+\subsection{Further attempts}
+\begin{itemize}[leftmargin=*]
+\item \textbf{Huge pages for the HMM buffers.} With the advice calls outside the timing (as
+  the code caches them), a streaming kernel already reaches \SI{23.9}{\giga\byte\per\second}
+  reading and \SI{25}{\giga\byte\per\second} writing pageable memory with \SI{4}{\kilo\byte}
+  pages; collapsing the range to \SI{2}{\mega\byte} pages changed nothing. The shortfall
+  against DMA is in our kernels, which stop reading or writing while they compute.
+\item \textbf{A separate streaming copy kernel} (\code{stream} mode) moves data between the
+  caller's memory and device memory at full speed, but it starves the decompose of SMs
+  (\us{902} instead of \us{72} for the first chunk): slower overall (GPU span \us{2452}
+  against \us{2245}). Kept as an option.
+\item \textbf{Two decompose streams.} Alternating decompose chunks between two equal-priority
+  streams lets each chunk start while the previous one finishes: two chunks now cost the same
+  as one, eight cost \us{2372} instead of \us{2705}.
+\item \textbf{Column-group streaming} of $b$'s column pass and of the inverse column pass
+  with the CRT was not built: it needs about eight groups per operand, and eight decompose
+  chunks still cost about \us{120} more than one, against about \us{50} of hidden work.
+\item \textbf{A software-pipelined decompose} (persistent blocks, two shared-memory tiles,
+  \code{cp.async} loads for the next tile while the current one is computed): correct, but
+  slower (\us{895} per Point \#1 operand against \us{667}): the two tiles take
+  \SI{56}{\kilo\byte}, so one block per SM, and word-by-word asynchronous copies cost more
+  instructions than they save.
+\item \textbf{Choosing the copy mode at setup.} Which mode wins depends on the machine, so
+  \code{fherma\_init} times the candidates on dummy operands (seven runs each, evicting the
+  caches between runs to mimic the harness's file I/O) and keeps the default unless another
+  mode is at least 5\,\% faster.
+\end{itemize}
+
+%======================================================================
+\section{Where the time goes now}
+
+\subsection{Point \#2}
+Wall clock about \us{700} median per call; GPU span about \us{590}. One call:
+\begin{center}
+\begin{tabular}{rp{0.74\textwidth}}
+\toprule
+time (\si{\micro\second}) & activity \\
+\midrule
+0--326 & four \MB{1.84} host-to-device transfers, back to back; $a$'s decompose and
+          forward NTT hidden under them \\
+326--434 & about \us{95} of kernels: last decompose, column pass on $b$,
+          \code{k\_ntt\_rows\_mul}, inverse column pass, first CRT chunk \\
+434--582 & device-to-host transfers of \MB{0.92}, \MB{1.84} and \MB{0.92}, back to back,
+          with the remaining CRT chunks underneath \\
+\bottomrule
+\end{tabular}
+\end{center}
+About \us{470} of the span is PCIe transfer at full speed; what remains is about
+\us{95} of kernels and \us{25}--\us{100} of host work at the edges.
+
+\subsection{Point \#1}
+Wall clock about \ms{2.3} median natively (first version: \ms{3.09}); GPU span \ms{2.24}.
+One call, in \code{hmm} mode:
+\begin{center}
+\begin{tabular}{rp{0.74\textwidth}}
+\toprule
+time (\si{\micro\second}) & activity \\
+\midrule
+0--1440 & input: $a$'s and $b$'s decompose kernels reading the caller's vectors over PCIe
+          (about \SI{20}{\giga\byte\per\second}); $a$'s forward NTT on its own stream underneath \\
+1440--1684 & \us{244} of kernels: column pass on $b$, \code{k\_ntt\_rows\_mul}, inverse
+            column pass (about four memory passes over the residues) \\
+1684--2340 & output: the CRT writing the result straight into the output vector over PCIe \\
+\bottomrule
+\end{tabular}
+\end{center}
+Host overhead outside the GPU span is about \us{60}. What remains above the floor is the
+\us{244} of kernels, plus the gap between HMM access (20--\SI{22}{\giga\byte\per\second}) and
+DMA (\SI{24.5}{\giga\byte\per\second}).
+
+%======================================================================
+\section{What did not help}
+\begin{center}
+\begin{tabular}{p{0.42\textwidth}p{0.48\textwidth}}
+\toprule
+attempt & outcome \\
+\midrule
+CRT: staging $Y$ in shared memory alone & \us{308} $\to$ \us{232}; the big gain came from
+  prime groups \\
+More chunks after the copy pool & slower: fixed cost per parallel copy \\
+Uneven input chunks & neutral or worse (GPU span \us{625}/\us{647} vs.\ \us{591}--\us{610}) \\
+Zero-copy (\code{mapped}) transfers & about 2\,\%, within noise; kept opt-in \\
+Spin loop without \code{pause} & no difference \\
+Decompose: templated $L$; lazy reduction alone & \us{20.6} $\to$ \us{19.8} $\to$ \us{19.4};
+  the limit was table loads \\
+Interleaved twiddle table & about \us{1} per NTT kernel; the cost is bytes \\
+Generated twiddles at Point \#2 & slower (\code{k\_ntt\_rows\_mul} 31 $\to$ \us{38}); the
+  tables fit in L2 there, hence the automatic rule \\
+CRT: 2 coefficients per thread; unroll by 8 & fewer blocks / more registers: slower \\
+Point \#1 host side: more threads, chunk shapes, later zero-fill & no gain; the later
+  zero-fill was worse \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%======================================================================
+\section{Summary at Point \#2}
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+stage & median per call \\
+\midrule
+first GPU run (GPU shared, best setting) & \ms{3.07} \\
+same day, old code, idle GPU (best setting) & \ms{2.14} \\
+after the copy pool and shallow pipeline & about \us{880} \\
+after spinning workers & about \us{760} \\
+after helper zero-fill and $1{:}2{:}1$ output chunks & about \us{700} \\
+inside FHERMA's challenge image & \us{703} \\
+\bottomrule
+\end{tabular}
+\end{center}
+The NTT overlap and the decompose and twiddle changes shortened the GPU span by about
+\us{40} more, inside the wall-clock noise.
+
+\appendix
+\section{Runtime settings}\label{app:settings}
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+variable & default & meaning \\
+\midrule
+\code{FHERMA\_IN}, \code{FHERMA\_OUT} & \code{hmm} & \code{hmm}, \code{staged}, \code{register}, \code{mapped} \\
+\code{FHERMA\_CHUNKS} & 1 (\code{hmm}), 2 & input chunks (equal) \\
+\code{FHERMA\_OUT\_CHUNKS} & --- & output chunks (equal) \\
+\code{FHERMA\_A/B/C\_CHUNKS} & $C$: \code{1} (\code{hmm}), \code{1,2,1} & chunk weights per operand \\
+\code{FHERMA\_THREADS} & $\min(16, \text{cores}/2)$ & host copy threads \\
+\code{FHERMA\_SPIN\_MS} & 20 & spin after a call before sleeping \\
+\code{FHERMA\_TWIDDLES} & \code{auto} & \code{table}, \code{gen} or \code{auto} (by table size) \\
+\code{FHERMA\_PROFILE} & off & per-phase GPU times and host timeline \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Reproducing the measurements}
+\begin{lstlisting}
+./build.sh                                   # all binaries (see HANDOVER.md)
+./run_tests.sh && ./run_tests.sh build/solution
+python3 make_big.py /tmp/p2 32768 868 21     # Point #2
+python3 make_big.py /tmp/p1 65536 1747 21    # Point #1
+build/solution /tmp/p2 && python3 oracle.py verify /tmp/p2
+nsys profile -t cuda --sample=none --cpuctxsw=none -o prof build/solution /tmp/p2
+./docker_check.sh 0                          # build and run in fherma/cupqc:0.6.0
+\end{lstlisting}
+
+\end{document}
