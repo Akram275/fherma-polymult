@@ -11,14 +11,20 @@
 //   d2h                                                     c0   c1  ..
 //
 // Tuning knobs, read once in fherma_init (defaults in brackets):
-//   FHERMA_IN=staged|register   how a and b reach the GPU            [staged]
-//   FHERMA_OUT=staged|register  how c comes back                     [staged]
+//   FHERMA_IN=staged|register|mapped|hmm   how a and b reach the GPU   [hmm]
+//   FHERMA_OUT=staged|register|mapped|hmm  how c comes back            [hmm]
 //     staged:   memcpy through pinned buffers allocated at init, chunk by chunk
 //     register: cudaHostRegister the caller's vectors for the call, DMA directly
 //     mapped:   memcpy through the same pinned buffers, mapped into the device:
 //               decompose reads its limbs from host memory over PCIe and CRT
 //               writes its limbs there, with no copy, event or stream hop per
 //               chunk (each costs ~25 us of API calls on rst-goose)
+//     hmm:      no staging at all: the decompose reads the caller's vectors and
+//               the CRT writes the answer's vector, through HMM (pageable memory
+//               the GPU can access), advised to stay in host memory and be
+//               mapped for the GPU. ~21 GB/s here against 24 for pinned DMA, but
+//               no host copies. Falls back to staged where the device cannot
+//               access pageable memory.
 //   FHERMA_CHUNKS=n             pipeline depth, input side: n equal chunks [2]
 //   FHERMA_OUT_CHUNKS=n         pipeline depth, output side          [FHERMA_CHUNKS]
 //   FHERMA_A_CHUNKS=w,w,..      a's chunks as relative weights (overrides FHERMA_CHUNKS)
@@ -89,8 +95,22 @@ k_decompose(const uint32_t* __restrict__ limbs, uint32_t* __restrict__ res,
     __shared__ uint32_t tile[rns::kDecTile * (L + 1)];
     const uint32_t kb = k0 + blockIdx.x * rns::kDecTile;
     const uint32_t nk = min(rns::kDecTile, k0 + count - kb);
-    for (uint32_t i = threadIdx.x; i < nk * L; i += blockDim.x) {
-        rns::dec_load<L>(i, tile, limbs, kb);
+    if (nk == rns::kDecTile && (L * rns::kDecTile) % 4 == 0) {
+        // A full block starts on a multiple of kDecTile coefficients, so its
+        // limbs are 16-byte aligned: load them 4 words at a time (fewer, wider
+        // requests, which matters when they cross PCIe in the mapped/hmm modes).
+        const uint4* src = reinterpret_cast<const uint4*>(limbs + static_cast<size_t>(kb) * L);
+        for (uint32_t i4 = threadIdx.x; i4 < rns::kDecTile * L / 4; i4 += blockDim.x) {
+            const uint4 v = src[i4];
+            rns::dec_place<L>(4 * i4, tile, v.x);
+            rns::dec_place<L>(4 * i4 + 1, tile, v.y);
+            rns::dec_place<L>(4 * i4 + 2, tile, v.z);
+            rns::dec_place<L>(4 * i4 + 3, tile, v.w);
+        }
+    } else {
+        for (uint32_t i = threadIdx.x; i < nk * L; i += blockDim.x) {
+            rns::dec_load<L>(i, tile, limbs, kb);
+        }
     }
     __syncthreads();
     for (uint32_t b = threadIdx.x; b < 32 * t.K; b += blockDim.x) {
@@ -225,14 +245,19 @@ k_crt(const uint32_t* __restrict__ Y, uint32_t* __restrict__ c,
 // ---------------------------------------------------------------------------
 // Host side.
 
-enum class Copy { staged, registered, mapped };
+enum class Copy { staged, registered, mapped, hmm };
 
+// Default hmm (falls back to staged where the device cannot access pageable
+// memory). Measured 2026-10-14, interleaved, L40S: N = 65536 / W = 1747 2616 us
+// staged -> 2309 us hmm; N = 32768 / W = 868 684 -> 624 us.
 Copy copy_mode(const char* var) {
     const char* v = std::getenv(var);
-    if (!v || !std::strcmp(v, "staged")) return Copy::staged;
+    if (!v) return Copy::hmm;
+    if (!std::strcmp(v, "staged")) return Copy::staged;
     if (!std::strcmp(v, "register")) return Copy::registered;
     if (!std::strcmp(v, "mapped")) return Copy::mapped;
-    throw std::runtime_error(std::string(var) + " must be staged, register or mapped");
+    if (!std::strcmp(v, "hmm")) return Copy::hmm;
+    throw std::runtime_error(std::string(var) + " must be staged, register, mapped or hmm");
 }
 
 // memcpy split into 64 KB pieces that the calling thread and a few workers
@@ -439,6 +464,8 @@ struct State {
     uint32_t *m_a = nullptr, *m_b = nullptr, *m_c = nullptr;     // the same, as the device sees them
 
     cudaStream_t comp = nullptr, h2d = nullptr, d2h = nullptr;
+    cudaStream_t ntt_a = nullptr;           // a's forward NTT, beside b's arrival
+    cudaEvent_t a_ready = nullptr, a_ntt_done = nullptr;
     struct Span {
         uint32_t k0, count;
     };
@@ -450,6 +477,11 @@ struct State {
 
     bool profile = false;
     bool gen_tw = false;                    // twiddles from the small tables (rns::use_gen_twiddles)
+    int dev = 0;
+    struct Range {
+        const void* p = nullptr;
+        size_t n = 0;
+    } advised[3];                           // a, b, c ranges already advised for HMM
     cudaEvent_t prof[5] = {};
 };
 
@@ -528,13 +560,18 @@ void launch_decompose(State& s, const uint32_t* limbs, uint32_t* res, uint32_t k
 
 // a's forward transform, enqueued right after a's decompose so it runs while
 // b is still on its way in.
+// On its own stream, after a's decompose: in the hmm and mapped modes b's
+// decompose kernels *are* b's transfer, and must not wait behind it.
 template <bool kGen>
 void launch_ntt_a(State& s) {
     const rns::NttGeom& g = s.g;
     const dim3 cols(1u << (g.logS - g.logC), s.t.K);
     const dim3 rows(s.t.N / g.T, s.t.K);
-    if (g.logR) k_ntt_cols<true><<<cols, kThreads, 0, s.comp>>>(s.d_A, nullptr, s.t, g);
-    k_ntt_rows_fwd<kGen><<<rows, kThreads, 0, s.comp>>>(s.d_A, s.t, g);
+    check(cudaEventRecord(s.a_ready, s.comp), "event");
+    check(cudaStreamWaitEvent(s.ntt_a, s.a_ready, 0), "wait");
+    if (g.logR) k_ntt_cols<true><<<cols, kThreads, 0, s.ntt_a>>>(s.d_A, nullptr, s.t, g);
+    k_ntt_rows_fwd<kGen><<<rows, kThreads, 0, s.ntt_a>>>(s.d_A, s.t, g);
+    check(cudaEventRecord(s.a_ntt_done, s.ntt_a), "event");
 }
 
 // The rest, once b is decomposed: b's forward transform, the product, the inverse.
@@ -544,6 +581,7 @@ void launch_ntt_rest(State& s) {
     const dim3 cols(1u << (g.logS - g.logC), s.t.K);
     const dim3 rows(s.t.N / g.T, s.t.K);
     if (g.logR) k_ntt_cols<true><<<cols, kThreads, 0, s.comp>>>(s.d_B, nullptr, s.t, g);
+    check(cudaStreamWaitEvent(s.comp, s.a_ntt_done, 0), "wait");
     k_ntt_rows_mul<true, kGen><<<rows, kThreads, 0, s.comp>>>(s.d_A, s.d_B, s.t, g);
     if (g.logR) k_ntt_cols<false><<<cols, kThreads, 0, s.comp>>>(s.d_A, nullptr, s.t, g);
 }
@@ -573,6 +611,20 @@ void report_profile(State& s, const HostClock::time_point (&t)[5]) {
                  ms[0] * 1e3, ms[1] * 1e3, ms[2] * 1e3, ms[3] * 1e3, us(0), us(1), us(2), us(3));
 }
 
+// HMM: keep [p, p + n) in host memory and mapped for the GPU, so kernels read or
+// write it over PCIe instead of migrating pages. Advice sticks to the address
+// range, and main.cpp's per-case vectors usually come back at the same address,
+// so a range already advised is skipped.
+void advise_host(State& s, int slot, const void* p, size_t n) {
+    State::Range& r = s.advised[slot];
+    if (r.p == p && r.n == n) return;
+    const cudaMemLocation host{cudaMemLocationTypeHost, 0}, gpu{cudaMemLocationTypeDevice, s.dev};
+    check(cudaMemAdvise(p, n, cudaMemAdviseSetPreferredLocation, host), "advise host");
+    check(cudaMemAdvise(p, n, cudaMemAdviseSetAccessedBy, gpu), "advise gpu");
+    r.p = p;
+    r.n = n;
+}
+
 }  // namespace
 
 void* fherma_init(const fherma::Point& p) {
@@ -593,6 +645,15 @@ void* fherma_init(const fherma::Point& p) {
         s->g = rns::make_geom(pl.logN);
         s->in_mode = copy_mode("FHERMA_IN");
         s->out_mode = copy_mode("FHERMA_OUT");
+        {
+            int pageable = 0;
+            check(cudaGetDevice(&s->dev), "device");
+            check(cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, s->dev), "attribute");
+            if (!pageable) {
+                if (s->in_mode == Copy::hmm) s->in_mode = Copy::staged;
+                if (s->out_mode == Copy::hmm) s->out_mode = Copy::staged;
+            }
+        }
         s->profile = std::getenv("FHERMA_PROFILE") != nullptr;
         const char* spin = std::getenv("FHERMA_SPIN_MS");
         const int spin_ms = spin ? std::max(0, std::atoi(spin)) : 20;
@@ -639,19 +700,34 @@ void* fherma_init(const fherma::Point& p) {
             check(cudaHostGetDevicePointer(reinterpret_cast<void**>(hm.second), *hm.first, 0), "mapped");
         }
 
-        check(cudaStreamCreateWithFlags(&s->comp, cudaStreamNonBlocking), "stream");
+        // comp carries the decompose kernels, which in the hmm and mapped modes are
+        // the input transfer itself: higher priority than a's NTT beside it, so
+        // their blocks get SMs first (otherwise b's first decompose started ~46 us
+        // late at N = 65536, behind the NTT's blocks).
+        int least = 0, greatest = 0;
+        check(cudaDeviceGetStreamPriorityRange(&least, &greatest), "priorities");
+        check(cudaStreamCreateWithPriority(&s->comp, cudaStreamNonBlocking, greatest), "stream");
         check(cudaStreamCreateWithFlags(&s->h2d, cudaStreamNonBlocking), "stream");
         check(cudaStreamCreateWithFlags(&s->d2h, cudaStreamNonBlocking), "stream");
+        check(cudaStreamCreateWithPriority(&s->ntt_a, cudaStreamNonBlocking, least), "stream");
+        check(cudaEventCreateWithFlags(&s->a_ready, cudaEventDisableTiming), "event");
+        check(cudaEventCreateWithFlags(&s->a_ntt_done, cudaEventDisableTiming), "event");
 
+        // With hmm there is no host copy to overlap, and each chunk boundary
+        // leaves a kernel tail idling the link: one chunk each way is fastest
+        // (N = 65536: GPU span 2242 us with 1/1 against 2404 with 2/1,2,1).
+        const bool hmm = s->in_mode == Copy::hmm;
         const char* env_in = std::getenv("FHERMA_CHUNKS");
-        const int in_n = std::max(1, env_in ? std::atoi(env_in) : 2);
+        const int in_n = std::max(1, env_in ? std::atoi(env_in) : (hmm ? 1 : 2));
         const char* env_out = std::getenv("FHERMA_OUT_CHUNKS");
         const int out_n = env_out ? std::max(1, std::atoi(env_out)) : in_n;
         s->a_chunks = spans(pl.N, weights("FHERMA_A_CHUNKS", in_n));
         s->b_chunks = spans(pl.N, weights("FHERMA_B_CHUNKS", in_n));
         s->c_chunks = spans(pl.N, env_out || std::getenv("FHERMA_C_CHUNKS")
                                       ? weights("FHERMA_C_CHUNKS", out_n)
-                                      : std::vector<double>{1, 2, 1});   // 2026-10-14: ~15 us better than 1,1
+                                      : s->out_mode == Copy::hmm
+                                            ? std::vector<double>{1}
+                                            : std::vector<double>{1, 2, 1});   // staged: ~15 us better than 1,1
         s->in_a.resize(s->a_chunks.size());
         s->in_b.resize(s->b_chunks.size());
         for (auto* evs : {&s->crt_done, &s->out_done}) evs->resize(s->c_chunks.size());
@@ -693,6 +769,12 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     const bool reg_out = s->out_mode == Copy::registered;
     const bool map_in = s->in_mode == Copy::mapped;
     const bool map_out = s->out_mode == Copy::mapped;
+    const bool hmm_in = s->in_mode == Copy::hmm;
+    const bool hmm_out = s->out_mode == Copy::hmm;
+    if (hmm_in) {
+        advise_host(*s, 0, in.a.data.data(), bytes);
+        advise_host(*s, 1, in.b.data.data(), bytes);
+    }
     std::vector<std::unique_ptr<Registration>> hold;
     if (reg_in) {
         hold.emplace_back(new Registration(in.a.data.data(), bytes));
@@ -734,6 +816,10 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
             const uint32_t count = chunks[ch].count;
             const size_t off = static_cast<size_t>(k0) * L;
             const size_t n = static_cast<size_t>(count) * L * sizeof(uint32_t);
+            if (hmm_in) {
+                launch_decompose(*s, src, d_res, k0, count);
+                continue;
+            }
             if (map_in) {
                 s->pool->copy(pin + off, src + off, n);
                 launch_decompose(*s, mapped, d_res, k0, count);
@@ -762,10 +848,21 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     // Out: each chunk's CRT, then its copy back once the CRT is done.
     // Mapped: the CRT writes the pinned buffer itself, and its end is the copy's.
     uint32_t* dst = reg_out ? out.c.data.data() : s->h_c;
+    if (hmm_out) {
+        // The CRT writes the answer's vector itself: it has to be sized (the
+        // helper's zero fill) and advised before the first CRT is enqueued.
+        s->helper->wait();
+        advise_host(*s, 2, out.c.data.data(), bytes);
+    }
     for (uint32_t ch = 0; ch < s->c_chunks.size(); ++ch) {
         const uint32_t k0 = s->c_chunks[ch].k0;
         const uint32_t count = s->c_chunks[ch].count;
         const size_t off = static_cast<size_t>(k0) * L;
+        if (hmm_out) {
+            launch_crt(*s, out.c.data.data(), k0, count);
+            check(cudaEventRecord(s->out_done[ch], s->comp), "event");
+            continue;
+        }
         if (map_out) {
             launch_crt(*s, s->m_c, k0, count);
             check(cudaEventRecord(s->out_done[ch], s->comp), "event");
@@ -784,6 +881,9 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
 
     if (reg_out) {
         check(cudaStreamSynchronize(s->d2h), "copy out");
+    } else if (hmm_out) {
+        t[3] = HostClock::now();
+        check(cudaEventSynchronize(s->out_done.back()), "crt");
     } else {
         s->helper->wait();
         t[3] = HostClock::now();
@@ -816,7 +916,10 @@ void fherma_free(void* state) {
     for (auto e : s->prof) {
         if (e) cudaEventDestroy(e);
     }
-    for (auto st : {s->comp, s->h2d, s->d2h}) {
+    for (auto e : {s->a_ready, s->a_ntt_done}) {
+        if (e) cudaEventDestroy(e);
+    }
+    for (auto st : {s->comp, s->h2d, s->d2h, s->ntt_a}) {
         if (st) cudaStreamDestroy(st);
     }
     for (void* p : s->device) cudaFree(p);

@@ -191,9 +191,16 @@ RNS_HD uint32_t pointwise(uint32_t a, uint32_t b, const Tables& t, int j) {
 
 // L is a template parameter (dispatched with with_L, like the CRT): the limb
 // loop unrolls and i / L, i % L are divisions by a constant.
+// Word i of the block's limbs into the padded tile (dec_load's placement; the
+// GPU kernel also uses it after loading 16 bytes at a time).
+template <int L>
+RNS_HD void dec_place(uint32_t i, uint32_t* tile, uint32_t w) {
+    tile[(i / L) * (L + 1) + i % L] = w;
+}
+
 template <int L>
 RNS_HD void dec_load(uint32_t i, uint32_t* tile, const uint32_t* limbs, uint32_t kb) {
-    tile[(i / L) * (L + 1) + i % L] = limbs[static_cast<size_t>(kb) * L + i];
+    dec_place<L>(i, tile, limbs[static_cast<size_t>(kb) * L + i]);
 }
 
 template <int L>
