@@ -43,11 +43,59 @@ struct Tables {
     const uint32_t* pneg;
     const uint32_t* pow2;      // K x L
     const uint32_t* pow2_s;
-    const Twiddle* psi;        // K x N
+    const Twiddle* psi;        // K x N, table path only (else null)
     const Twiddle* ipsi;
     const uint32_t* scale;     // K
     const uint32_t* scale_s;
+    // Generated path: Plan::tw_hi etc., and s.
+    const uint32_t* tw_hi;     // K x (N >> tw_s)
+    const uint32_t* tw_lo;     // K x 2^tw_s
+    const uint32_t* itw_hi;
+    const uint32_t* itw_lo;
+    uint32_t tw_s, logN;
+    const Twiddle* col_psi;    // K x (N >> tw_s): the column pass's twiddles
+    const Twiddle* col_ipsi;
 };
+
+// Twiddle sources for the butterflies: mul(y, i) = y * w_i mod p, where w_i is
+// psi^bitrev(i) (forward) or psi^-bitrev(i) (inverse) for one prime.
+struct TableTwiddles {     // read from the full table, Shoup form
+    const Twiddle* w;
+    uint32_t p;
+    RNS_HD uint32_t mul(uint32_t y, uint32_t i) const {
+        const Twiddle t = w[i];
+        return mul_shoup(y, t.w, t.ws, p);
+    }
+};
+
+struct GenTwiddles {       // built from two small Montgomery-form tables
+    const uint32_t* hi;
+    const uint32_t* lo;
+    uint32_t s, logN, p, pneg;
+    RNS_HD uint32_t mul(uint32_t y, uint32_t i) const {
+        const uint32_t e = bitrev_bits(i, logN);
+        const uint32_t w = mont_mul(hi[e >> s], lo[e & ((1u << s) - 1)], p, pneg);   // psi^e 2^32
+        return mont_mul(y, w, p, pneg);
+    }
+};
+
+// The column pass's twiddle indices, (1 << (logR - lt - 1)) + blk, are all below
+// 2^logR <= N >> tw_s: it reads the head table on both paths.
+RNS_HD TableTwiddles col_twiddles(const Tables& t, int j, bool forward) {
+    const size_t hn = static_cast<size_t>(t.N) >> t.tw_s;
+    return TableTwiddles{(forward ? t.col_psi : t.col_ipsi) + j * hn, t.p[j]};
+}
+
+template <bool kGen>
+RNS_HD auto twiddles(const Tables& t, int j, bool forward) {
+    if constexpr (kGen) {
+        const size_t hn = static_cast<size_t>(t.N) >> t.tw_s, ln = static_cast<size_t>(1) << t.tw_s;
+        return GenTwiddles{(forward ? t.tw_hi : t.itw_hi) + j * hn, (forward ? t.tw_lo : t.itw_lo) + j * ln,
+                           t.tw_s, t.logN, t.p[j], t.pneg[j]};
+    } else {
+        return TableTwiddles{(forward ? t.psi : t.ipsi) + static_cast<size_t>(j) * t.N, t.p[j]};
+    }
+}
 
 struct NttGeom {
     uint32_t N, T;
@@ -104,14 +152,20 @@ RNS_HD Pair row_pair(uint32_t b, uint32_t lt, uint32_t base, const NttGeom& g) {
 }
 
 // Butterflies on a tile, in either pass.
-RNS_HD void fwd_butterfly(uint32_t* tile, const Pair& pr, const Twiddle* tw, uint32_t p) {
-    const Twiddle t = tw[pr.tw];
-    ct_butterfly(tile[pr.lo], tile[pr.hi], t.w, t.ws, p);
+// Forward (Cooley-Tukey): (x, y) -> (x + w y, x - w y).
+template <class Tw>
+RNS_HD void fwd_butterfly(uint32_t* tile, const Pair& pr, const Tw& tw, uint32_t p) {
+    const uint32_t u = tile[pr.lo], v = tw.mul(tile[pr.hi], pr.tw);
+    tile[pr.lo] = add_mod(u, v, p);
+    tile[pr.hi] = sub_mod(u, v, p);
 }
 
-RNS_HD void inv_butterfly(uint32_t* tile, const Pair& pr, const Twiddle* tw, uint32_t p) {
-    const Twiddle t = tw[pr.tw];
-    gs_butterfly(tile[pr.lo], tile[pr.hi], t.w, t.ws, p);
+// Inverse (Gentleman-Sande): (x, y) -> (x + y, (x - y) w).
+template <class Tw>
+RNS_HD void inv_butterfly(uint32_t* tile, const Pair& pr, const Tw& tw, uint32_t p) {
+    const uint32_t u = tile[pr.lo], v = tile[pr.hi];
+    tile[pr.lo] = add_mod(u, v, p);
+    tile[pr.hi] = tw.mul(sub_mod(u, v, p), pr.tw);
 }
 
 // Pointwise product for prime j, times N^-1 (P/p_j)^-1 so the inverse NTT

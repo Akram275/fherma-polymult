@@ -37,6 +37,7 @@ namespace rns {
 constexpr int kMaxL = 64;          // limbs per coefficient (W <= 2048)
 constexpr int kMaxK = 160;         // primes (~115 at W = 1747, N = 2^16; ~134 at W = 2048)
 constexpr int kMaxLogN = 22;       // the NTT's row pass needs rows of at most kNttTile
+constexpr double kGenTwiddleBytes = 64e6;   // full tables above this: generate twiddles
 constexpr int kMarginBits = 20;    // |c| / P < 2^-20: the CRT rounding is exact
 
 // ---------------------------------------------------------------------------
@@ -65,6 +66,17 @@ RNS_HD uint32_t sub_mod(uint32_t a, uint32_t b, uint32_t p) {
 RNS_HD uint32_t mul_shoup(uint32_t a, uint32_t w, uint32_t ws, uint32_t p) {
     const uint32_t r = a * w - mulhi(a, ws) * p;   // mod 2^32, true value < 2p
     return r >= p ? r - p : r;
+}
+
+// The low `bits` bits of x in reverse order (bits in [1, 32]).
+RNS_HD uint32_t bitrev_bits(uint32_t x, uint32_t bits) {
+#ifdef __CUDA_ARCH__
+    return __brev(x) >> (32 - bits);
+#else
+    uint32_t r = 0;
+    for (uint32_t i = 0; i < bits; ++i) r |= ((x >> i) & 1u) << (bits - 1 - i);
+    return r;
+#endif
 }
 
 // mul_shoup without its final correction: a * w mod p plus 0 or p, below 2p.

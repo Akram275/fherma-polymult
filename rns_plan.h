@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -22,8 +24,19 @@ struct Plan {
 
     std::vector<uint32_t> p, pneg;            // K; pneg = -p^-1 mod 2^32
     std::vector<uint32_t> pow2, pow2_s;       // K x L: 2^(32 l) mod p_j
-    std::vector<Twiddle> psi;                 // K x N: psi^bitrev(i), with its Shoup companion
-    std::vector<Twiddle> ipsi;                // K x N: psi^-bitrev(i), likewise
+    std::vector<uint32_t> root, iroot;        // K: psi_j and psi_j^-1, primitive 2N-th roots
+    // Twiddles psi^bitrev(i) come in two forms (see use_gen_twiddles):
+    // full tables, K x N, each with its Shoup companion (add_full_twiddles) ...
+    std::vector<Twiddle> psi;                 // K x N: psi^bitrev(i)
+    std::vector<Twiddle> ipsi;                // K x N: psi^-bitrev(i)
+    // ... or, always built, two small Montgomery-form tables per prime and
+    // direction: psi^e = psi^((e >> s) << s) * psi^(e & (2^s - 1)).
+    // The column pass only uses indices below N >> s, so it always reads this
+    // head of the full table (Shoup form), small enough to stay cached.
+    std::vector<Twiddle> col_psi, col_ipsi;   // K x (N >> s)
+    uint32_t tw_s = 0;                        // s = ceil(logN / 2)
+    std::vector<uint32_t> tw_hi, itw_hi;      // K x (N >> s): psi^(k 2^s) 2^32 mod p
+    std::vector<uint32_t> tw_lo, itw_lo;      // K x 2^s:      psi^k 2^32 mod p
     std::vector<uint32_t> scale, scale_s;     // K: N^-1 (P/p_j)^-1 2^32 mod p_j
 
     std::vector<double> p_recip;              // K
@@ -145,8 +158,16 @@ inline Plan make_plan(uint32_t N, const uint32_t* q, int L) {
     pl.pneg.resize(K);
     pl.pow2.resize(K * L);
     pl.pow2_s.resize(K * L);
-    pl.psi.resize(static_cast<size_t>(K) * N);
-    pl.ipsi.resize(static_cast<size_t>(K) * N);
+    pl.root.resize(K);
+    pl.iroot.resize(K);
+    pl.tw_s = (pl.logN + 1) / 2;
+    const size_t hn = N >> pl.tw_s, ln = size_t(1) << pl.tw_s;
+    pl.tw_hi.resize(K * hn);
+    pl.itw_hi.resize(K * hn);
+    pl.tw_lo.resize(K * ln);
+    pl.itw_lo.resize(K * ln);
+    pl.col_psi.resize(K * hn);
+    pl.col_ipsi.resize(K * hn);
     pl.scale.resize(K);
     pl.scale_s.resize(K);
     pl.p_recip.resize(K);
@@ -169,12 +190,22 @@ inline Plan make_plan(uint32_t N, const uint32_t* q, int L) {
             if (pow_mod(cand, N, p) == p - 1) psi = cand;
         }
         const uint32_t ipsi = pow_mod(psi, p - 2, p);
-        for (uint32_t i = 0; i < N; ++i) {
-            const uint32_t e = bitrev(i, pl.logN);
-            const size_t at = static_cast<size_t>(j) * N + i;
+        pl.root[j] = psi;
+        pl.iroot[j] = ipsi;
+        auto mont = [&](uint32_t x) { return static_cast<uint32_t>((static_cast<uint64_t>(x) << 32) % p); };
+        for (size_t k = 0; k < hn; ++k) {
+            pl.tw_hi[j * hn + k] = mont(pow_mod(psi, k << pl.tw_s, p));
+            pl.itw_hi[j * hn + k] = mont(pow_mod(ipsi, k << pl.tw_s, p));
+        }
+        for (size_t k = 0; k < ln; ++k) {
+            pl.tw_lo[j * ln + k] = mont(pow_mod(psi, k, p));
+            pl.itw_lo[j * ln + k] = mont(pow_mod(ipsi, k, p));
+        }
+        for (size_t i = 0; i < hn; ++i) {
+            const uint32_t e = bitrev(static_cast<uint32_t>(i), pl.logN);
             const uint32_t w = pow_mod(psi, e, p), iw = pow_mod(ipsi, e, p);
-            pl.psi[at] = Twiddle{w, shoup(w, p)};
-            pl.ipsi[at] = Twiddle{iw, shoup(iw, p)};
+            pl.col_psi[j * hn + i] = Twiddle{w, shoup(w, p)};
+            pl.col_ipsi[j * hn + i] = Twiddle{iw, shoup(iw, p)};
         }
 
         uint64_t Pj = 1;                       // P/p_j mod p_j
@@ -215,6 +246,37 @@ inline Plan make_plan(uint32_t N, const uint32_t* q, int L) {
         std::copy(neg.begin(), neg.end(), pl.negvP.begin() + v * L);
     }
     return pl;
+}
+
+// The full K x N twiddle tables, for the table path (use_gen_twiddles false).
+inline void add_full_twiddles(Plan& pl) {
+    using namespace detail;
+    const size_t N = pl.N;
+    pl.psi.resize(static_cast<size_t>(pl.K) * N);
+    pl.ipsi.resize(static_cast<size_t>(pl.K) * N);
+    for (int j = 0; j < pl.K; ++j) {
+        const uint32_t p = pl.p[j];
+        for (uint32_t i = 0; i < N; ++i) {
+            const uint32_t e = bitrev(i, pl.logN);
+            const size_t at = static_cast<size_t>(j) * N + i;
+            const uint32_t w = pow_mod(pl.root[j], e, p), iw = pow_mod(pl.iroot[j], e, p);
+            pl.psi[at] = Twiddle{w, shoup(w, p)};
+            pl.ipsi[at] = Twiddle{iw, shoup(iw, p)};
+        }
+    }
+}
+
+// Whether the NTT computes its twiddles from the small tables (true) or reads the
+// full ones (false). The full tables are 16 K N bytes: 30 MB at N = 32768, W = 868,
+// 121 MB at N = 65536, W = 1747, where they no longer fit in L2 and stream from
+// DRAM on every pass. FHERMA_TWIDDLES=table|gen overrides the size rule.
+inline bool use_gen_twiddles(const Plan& pl) {
+    if (const char* v = std::getenv("FHERMA_TWIDDLES")) {
+        if (!std::strcmp(v, "gen")) return true;
+        if (!std::strcmp(v, "table")) return false;
+        if (std::strcmp(v, "auto")) throw std::runtime_error("FHERMA_TWIDDLES must be table, gen or auto");
+    }
+    return 16.0 * pl.K * pl.N > kGenTwiddleBytes;
 }
 
 }  // namespace rns

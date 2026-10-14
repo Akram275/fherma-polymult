@@ -109,7 +109,7 @@ k_ntt_cols(uint32_t* __restrict__ A, uint32_t* __restrict__ B, rns::Tables t, rn
     const uint32_t r0 = blockIdx.x << g.logC;
     uint32_t* a = A + row;
     uint32_t* b = B ? B + row : nullptr;
-    const rns::Twiddle* w = (kForward ? t.psi : t.ipsi) + row;
+    const rns::TableTwiddles w = rns::col_twiddles(t, j, kForward);
     const uint32_t p = t.p[j];
 
     for (uint32_t i = threadIdx.x; i < g.T; i += blockDim.x) {
@@ -140,6 +140,7 @@ k_ntt_cols(uint32_t* __restrict__ A, uint32_t* __restrict__ B, rns::Tables t, rn
 
 // Row pass, forward stages on A alone, back to A: a's whole forward transform
 // can then run while b is still being copied in.
+template <bool kGen>
 __global__ void __launch_bounds__(kThreads)
 k_ntt_rows_fwd(uint32_t* __restrict__ A, rns::Tables t, rns::NttGeom g) {
     __shared__ uint32_t ta[rns::kNttTile];
@@ -148,13 +149,14 @@ k_ntt_rows_fwd(uint32_t* __restrict__ A, rns::Tables t, rns::NttGeom g) {
     const uint32_t base = blockIdx.x * g.T;
     uint32_t* a = A + row + base;
     const uint32_t p = t.p[j];
+    const auto fw = rns::twiddles<kGen>(t, j, true);
 
     for (uint32_t i = threadIdx.x; i < g.T; i += blockDim.x) ta[i] = a[i];
     __syncthreads();
     for (uint32_t s = 0; s < g.logS; ++s) {
         const uint32_t lt = g.logS - 1 - s;
         for (uint32_t bf = threadIdx.x; bf < g.T / 2; bf += blockDim.x) {
-            rns::fwd_butterfly(ta, rns::row_pair(bf, lt, base, g), t.psi + row, p);
+            rns::fwd_butterfly(ta, rns::row_pair(bf, lt, base, g), fw, p);
         }
         __syncthreads();
     }
@@ -163,7 +165,7 @@ k_ntt_rows_fwd(uint32_t* __restrict__ A, rns::Tables t, rns::NttGeom g) {
 
 // Row pass: forward on A (unless kAReady: k_ntt_rows_fwd did it) and B,
 // pointwise into A, inverse on A, one tile.
-template <bool kAReady>
+template <bool kAReady, bool kGen>
 __global__ void __launch_bounds__(kThreads)
 k_ntt_rows_mul(uint32_t* __restrict__ A, const uint32_t* __restrict__ B, rns::Tables t, rns::NttGeom g) {
     __shared__ uint32_t ta[rns::kNttTile], tb[rns::kNttTile];
@@ -173,6 +175,8 @@ k_ntt_rows_mul(uint32_t* __restrict__ A, const uint32_t* __restrict__ B, rns::Ta
     uint32_t* a = A + row + base;
     const uint32_t* b = B + row + base;
     const uint32_t p = t.p[j];
+    const auto fw = rns::twiddles<kGen>(t, j, true);
+    const auto iw = rns::twiddles<kGen>(t, j, false);
 
     for (uint32_t i = threadIdx.x; i < g.T; i += blockDim.x) {
         ta[i] = a[i];
@@ -183,8 +187,8 @@ k_ntt_rows_mul(uint32_t* __restrict__ A, const uint32_t* __restrict__ B, rns::Ta
         const uint32_t lt = g.logS - 1 - s;
         for (uint32_t bf = threadIdx.x; bf < g.T / 2; bf += blockDim.x) {
             const rns::Pair pr = rns::row_pair(bf, lt, base, g);
-            if (!kAReady) rns::fwd_butterfly(ta, pr, t.psi + row, p);
-            rns::fwd_butterfly(tb, pr, t.psi + row, p);
+            if (!kAReady) rns::fwd_butterfly(ta, pr, fw, p);
+            rns::fwd_butterfly(tb, pr, fw, p);
         }
         __syncthreads();
     }
@@ -194,7 +198,7 @@ k_ntt_rows_mul(uint32_t* __restrict__ A, const uint32_t* __restrict__ B, rns::Ta
     __syncthreads();
     for (uint32_t lt = 0; lt < g.logS; ++lt) {
         for (uint32_t bf = threadIdx.x; bf < g.T / 2; bf += blockDim.x) {
-            rns::inv_butterfly(ta, rns::row_pair(bf, lt, base, g), t.ipsi + row, p);
+            rns::inv_butterfly(ta, rns::row_pair(bf, lt, base, g), iw, p);
         }
         __syncthreads();
     }
@@ -455,6 +459,7 @@ struct State {
     std::unique_ptr<Helper> helper;
 
     bool profile = false;
+    bool gen_tw = false;                    // twiddles from the small tables (rns::use_gen_twiddles)
     cudaEvent_t prof[5] = {};
 };
 
@@ -533,23 +538,28 @@ void launch_decompose(State& s, const uint32_t* limbs, uint32_t* res, uint32_t k
 
 // a's forward transform, enqueued right after a's decompose so it runs while
 // b is still on its way in.
+template <bool kGen>
 void launch_ntt_a(State& s) {
     const rns::NttGeom& g = s.g;
     const dim3 cols(1u << (g.logS - g.logC), s.t.K);
     const dim3 rows(s.t.N / g.T, s.t.K);
     if (g.logR) k_ntt_cols<true><<<cols, kThreads, 0, s.comp>>>(s.d_A, nullptr, s.t, g);
-    k_ntt_rows_fwd<<<rows, kThreads, 0, s.comp>>>(s.d_A, s.t, g);
+    k_ntt_rows_fwd<kGen><<<rows, kThreads, 0, s.comp>>>(s.d_A, s.t, g);
 }
 
 // The rest, once b is decomposed: b's forward transform, the product, the inverse.
+template <bool kGen>
 void launch_ntt_rest(State& s) {
     const rns::NttGeom& g = s.g;
     const dim3 cols(1u << (g.logS - g.logC), s.t.K);
     const dim3 rows(s.t.N / g.T, s.t.K);
     if (g.logR) k_ntt_cols<true><<<cols, kThreads, 0, s.comp>>>(s.d_B, nullptr, s.t, g);
-    k_ntt_rows_mul<true><<<rows, kThreads, 0, s.comp>>>(s.d_A, s.d_B, s.t, g);
+    k_ntt_rows_mul<true, kGen><<<rows, kThreads, 0, s.comp>>>(s.d_A, s.d_B, s.t, g);
     if (g.logR) k_ntt_cols<false><<<cols, kThreads, 0, s.comp>>>(s.d_A, nullptr, s.t, g);
 }
+
+void launch_ntt_a(State& s) { s.gen_tw ? launch_ntt_a<true>(s) : launch_ntt_a<false>(s); }
+void launch_ntt_rest(State& s) { s.gen_tw ? launch_ntt_rest<true>(s) : launch_ntt_rest<false>(s); }
 
 void launch_crt(State& s, uint32_t* c, uint32_t k0, uint32_t count) {
     const uint32_t blocks = (count + rns::kCrtTile - 1) / rns::kCrtTile;
@@ -587,6 +597,8 @@ void* fherma_init(const fherma::Point& p) {
     auto* s = new State{};
     try {
         s->plan = rns::make_plan(p.N, p.q.data.data(), static_cast<int>(p.L));
+        s->gen_tw = rns::use_gen_twiddles(s->plan);
+        if (!s->gen_tw) rns::add_full_twiddles(s->plan);
         const rns::Plan& pl = s->plan;
         s->g = rns::make_geom(pl.logN);
         s->in_mode = copy_mode("FHERMA_IN");
@@ -600,8 +612,10 @@ void* fherma_init(const fherma::Point& p) {
         s->t = rns::Tables{pl.K, pl.L, pl.N,
                            upload(*s, pl.p), upload(*s, pl.pneg),
                            upload(*s, pl.pow2), upload(*s, pl.pow2_s),
-                           upload(*s, pl.psi), upload(*s, pl.ipsi),
-                           upload(*s, pl.scale), upload(*s, pl.scale_s)};
+                           s->gen_tw ? nullptr : upload(*s, pl.psi), s->gen_tw ? nullptr : upload(*s, pl.ipsi),
+                           upload(*s, pl.scale), upload(*s, pl.scale_s),
+                           upload(*s, pl.tw_hi), upload(*s, pl.tw_lo), upload(*s, pl.itw_hi), upload(*s, pl.itw_lo),
+                           pl.tw_s, pl.logN, upload(*s, pl.col_psi), upload(*s, pl.col_ipsi)};
         s->crt = rns::CrtView{pl.K, rns::Modulus{upload(*s, pl.q), pl.L, pl.q_top},
                               upload(*s, pl.p_recip), upload(*s, pl.M), upload(*s, pl.negvP)};
 

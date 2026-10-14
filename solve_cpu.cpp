@@ -16,6 +16,7 @@
 
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -25,13 +26,16 @@ struct State {
     rns::Tables t;
     rns::NttGeom g;
     std::vector<uint32_t> A, B;     // K x N residues
+    bool gen_tw = false;            // the GPU's twiddle path, rns::use_gen_twiddles
 };
 
 rns::Tables tables(const rns::Plan& pl) {
     return rns::Tables{pl.K, pl.L, pl.N,
                        pl.p.data(), pl.pneg.data(), pl.pow2.data(), pl.pow2_s.data(),
-                       pl.psi.data(), pl.ipsi.data(),
-                       pl.scale.data(), pl.scale_s.data()};
+                       pl.psi.empty() ? nullptr : pl.psi.data(), pl.ipsi.empty() ? nullptr : pl.ipsi.data(),
+                       pl.scale.data(), pl.scale_s.data(),
+                       pl.tw_hi.data(), pl.tw_lo.data(), pl.itw_hi.data(), pl.itw_lo.data(),
+                       pl.tw_s, pl.logN, pl.col_psi.data(), pl.col_ipsi.data()};
 }
 
 // One phase of one block: items 0 .. count-1, which a block's threads share.
@@ -83,7 +87,7 @@ void ntt_cols(State& s, bool forward, std::vector<uint32_t>& X, std::vector<uint
             uint32_t* a = &X[static_cast<size_t>(j) * t.N];
             uint32_t* b = both ? &(*Y)[static_cast<size_t>(j) * t.N] : nullptr;
             const uint32_t r0 = blk << g.logC;
-            const rns::Twiddle* w = (forward ? t.psi : t.ipsi) + static_cast<size_t>(j) * t.N;
+            const rns::TableTwiddles w = rns::col_twiddles(t, j, forward);
             const uint32_t p = t.p[j];
 
             phase(g.T, [&](uint32_t i) {
@@ -113,6 +117,7 @@ void ntt_cols(State& s, bool forward, std::vector<uint32_t>& X, std::vector<uint
 // Row pass: forward on A and B, pointwise into A, inverse on A.
 // Forward row stages on A alone, back to A (k_ntt_rows_fwd): lets a's whole
 // forward transform run while b is still on its way in.
+template <bool kGen>
 void ntt_rows_fwd(State& s) {
     const rns::Tables& t = s.t;
     const rns::NttGeom g = s.g;
@@ -131,7 +136,7 @@ void ntt_rows_fwd(State& s) {
                 const uint32_t lt = g.logS - 1 - k;
                 stage(g, [&](uint32_t bf) { return rns::row_pair(bf, lt, base, g); },
                       [&](const rns::Pair& pr) {
-                          rns::fwd_butterfly(ta.data(), pr, t.psi + row, p);
+                          rns::fwd_butterfly(ta.data(), pr, rns::twiddles<kGen>(t, j, true), p);
                       });
             }
             phase(g.T, [&](uint32_t i) { a[i] = ta[i]; });
@@ -140,6 +145,7 @@ void ntt_rows_fwd(State& s) {
 }
 
 // a_ready: A already went through ntt_rows_fwd, so only B's forward stages run.
+template <bool kGen>
 void ntt_rows_mul(State& s, bool a_ready) {
     const rns::Tables& t = s.t;
     const rns::NttGeom g = s.g;
@@ -159,15 +165,15 @@ void ntt_rows_mul(State& s, bool a_ready) {
                 const uint32_t lt = g.logS - 1 - k;
                 stage(g, [&](uint32_t bf) { return rns::row_pair(bf, lt, base, g); },
                       [&](const rns::Pair& pr) {
-                          if (!a_ready) rns::fwd_butterfly(ta.data(), pr, t.psi + row, p);
-                          rns::fwd_butterfly(tb.data(), pr, t.psi + row, p);
+                          if (!a_ready) rns::fwd_butterfly(ta.data(), pr, rns::twiddles<kGen>(t, j, true), p);
+                          rns::fwd_butterfly(tb.data(), pr, rns::twiddles<kGen>(t, j, true), p);
                       });
             }
             phase(g.T, [&](uint32_t i) { ta[i] = rns::pointwise(ta[i], tb[i], t, j); });
             for (uint32_t lt = 0; lt < g.logS; ++lt) {
                 stage(g, [&](uint32_t bf) { return rns::row_pair(bf, lt, base, g); },
                       [&](const rns::Pair& pr) {
-                          rns::inv_butterfly(ta.data(), pr, t.ipsi + row, p);
+                          rns::inv_butterfly(ta.data(), pr, rns::twiddles<kGen>(t, j, false), p);
                       });
             }
             phase(g.T, [&](uint32_t i) { a[i] = ta[i]; });
@@ -203,6 +209,8 @@ void crt(const State& s, std::vector<uint32_t>& c) {
 
 void* fherma_init(const fherma::Point& p) {
     auto* s = new State{rns::make_plan(p.N, p.q.data.data(), static_cast<int>(p.L)), {}, {}, {}, {}};
+    s->gen_tw = rns::use_gen_twiddles(s->plan);
+    if (!s->gen_tw) rns::add_full_twiddles(s->plan);
     s->t = tables(s->plan);
     s->g = rns::make_geom(s->plan.logN);
     const size_t residues = static_cast<size_t>(s->plan.K) * s->plan.N;
@@ -221,11 +229,19 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
         decompose<decltype(Lc)::value>(*s, in.b.data, s->B);
     });
     // The GPU order: a's forward transform while b is still arriving, then b's.
-    ntt_cols(*s, /*forward=*/true, s->A, nullptr);
-    ntt_rows_fwd(*s);
-    ntt_cols(*s, /*forward=*/true, s->B, nullptr);
-    ntt_rows_mul(*s, /*a_ready=*/true);
-    ntt_cols(*s, /*forward=*/false, s->A, nullptr);
+    auto ntt = [&](auto gen) {
+        constexpr bool kGen = decltype(gen)::value;
+        ntt_cols(*s, /*forward=*/true, s->A, nullptr);
+        ntt_rows_fwd<kGen>(*s);
+        ntt_cols(*s, /*forward=*/true, s->B, nullptr);
+        ntt_rows_mul<kGen>(*s, /*a_ready=*/true);
+        ntt_cols(*s, /*forward=*/false, s->A, nullptr);
+    };
+    if (s->gen_tw) {
+        ntt(std::true_type{});
+    } else {
+        ntt(std::false_type{});
+    }
 
     fherma::Outputs out;
     out.c.shape = {static_cast<int64_t>(N), static_cast<int64_t>(L)};
