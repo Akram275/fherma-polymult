@@ -19,8 +19,15 @@
 //               decompose reads its limbs from host memory over PCIe and CRT
 //               writes its limbs there, with no copy, event or stream hop per
 //               chunk (each costs ~25 us of API calls on rst-goose)
-//   FHERMA_CHUNKS=n             pipeline depth, input side           [2]
+//   FHERMA_CHUNKS=n             pipeline depth, input side: n equal chunks [2]
 //   FHERMA_OUT_CHUNKS=n         pipeline depth, output side          [FHERMA_CHUNKS]
+//   FHERMA_A_CHUNKS=w,w,..      a's chunks as relative weights (overrides FHERMA_CHUNKS)
+//   FHERMA_B_CHUNKS=w,w,..      b's chunks, likewise
+//   FHERMA_C_CHUNKS=w,w,..      c's chunks (overrides FHERMA_OUT_CHUNKS) [1,2,1 if neither is set]
+//     A small first chunk of a starts the first DMA sooner, a small last chunk
+//     of b leaves less decompose after the last DMA; on the output side, a
+//     small first chunk starts the first D2H sooner and a small last one leaves
+//     less to copy out after the last.
 //   FHERMA_THREADS=n            host threads for the staged memcpys   [min(16, cores / 2)]
 //   FHERMA_SPIN_MS=n            copy threads keep spinning n ms after a call [20]
 //     Waking sleeping threads costs ~150-200 us per call on rst-goose, and
@@ -406,8 +413,10 @@ struct State {
     uint32_t *m_a = nullptr, *m_b = nullptr, *m_c = nullptr;     // the same, as the device sees them
 
     cudaStream_t comp = nullptr, h2d = nullptr, d2h = nullptr;
-    uint32_t chunk = 0, chunks = 0;           // input side
-    uint32_t ochunk = 0, ochunks = 0;         // output side
+    struct Span {
+        uint32_t k0, count;
+    };
+    std::vector<Span> a_chunks, b_chunks, c_chunks;   // coefficient ranges
     std::vector<cudaEvent_t> in_a, in_b, crt_done, out_done;
     Copy in_mode = Copy::staged, out_mode = Copy::staged;
     std::unique_ptr<CopyPool> pool;
@@ -416,6 +425,42 @@ struct State {
     bool profile = false;
     cudaEvent_t prof[5] = {};
 };
+
+// Relative chunk weights from var ("1,3"), or n equal ones.
+std::vector<double> weights(const char* var, int n) {
+    std::vector<double> w;
+    if (const char* v = std::getenv(var)) {
+        for (const char* p = v; *p;) {
+            char* end = nullptr;
+            const double x = std::strtod(p, &end);
+            if (end == p || x <= 0) throw std::runtime_error(std::string(var) + ": positive weights, comma separated");
+            w.push_back(x);
+            p = *end == ',' ? end + 1 : end;
+        }
+    }
+    if (w.empty()) w.assign(static_cast<size_t>(n), 1.0);
+    return w;
+}
+
+// Coefficient ranges in proportion to w. Every chunk but the last starts and
+// ends on a multiple of both block tiles; empty chunks are dropped.
+std::vector<State::Span> spans(uint32_t N, const std::vector<double>& w) {
+    const uint32_t align = std::max(rns::kDecTile, rns::kCrtTile);
+    double total = 0;
+    for (double x : w) total += x;
+    std::vector<State::Span> out;
+    double acc = 0;
+    uint32_t k0 = 0;
+    for (size_t i = 0; i < w.size(); ++i) {
+        acc += w[i];
+        uint32_t k1 = i + 1 == w.size() ? N
+                                         : static_cast<uint32_t>(std::lround(acc / total * N / align)) * align;
+        k1 = std::min(std::max(k1, k0), N);
+        if (k1 > k0) out.push_back(State::Span{k0, k1 - k0});
+        k0 = k1;
+    }
+    return out;
+}
 
 template <class T>
 T* device_alloc(State& s, size_t count) {
@@ -532,20 +577,18 @@ void* fherma_init(const fherma::Point& p) {
         check(cudaStreamCreateWithFlags(&s->h2d, cudaStreamNonBlocking), "stream");
         check(cudaStreamCreateWithFlags(&s->d2h, cudaStreamNonBlocking), "stream");
 
-        // Chunks start on multiples of both block tiles.
-        auto split = [&](const char* var, uint32_t fallback, uint32_t& chunk, uint32_t& chunks) {
-            const char* env = std::getenv(var);
-            const uint32_t want = std::max(1, env ? std::atoi(env) : static_cast<int>(fallback));
-            const uint32_t align = std::max(rns::kDecTile, rns::kCrtTile);
-            chunk = (pl.N + want - 1) / want;
-            chunk = (chunk + align - 1) / align * align;
-            chunk = std::min(chunk, pl.N);
-            chunks = (pl.N + chunk - 1) / chunk;
-        };
-        split("FHERMA_CHUNKS", 2, s->chunk, s->chunks);
-        split("FHERMA_OUT_CHUNKS", s->chunks, s->ochunk, s->ochunks);
-        for (auto* evs : {&s->in_a, &s->in_b}) evs->resize(s->chunks);
-        for (auto* evs : {&s->crt_done, &s->out_done}) evs->resize(s->ochunks);
+        const char* env_in = std::getenv("FHERMA_CHUNKS");
+        const int in_n = std::max(1, env_in ? std::atoi(env_in) : 2);
+        const char* env_out = std::getenv("FHERMA_OUT_CHUNKS");
+        const int out_n = env_out ? std::max(1, std::atoi(env_out)) : in_n;
+        s->a_chunks = spans(pl.N, weights("FHERMA_A_CHUNKS", in_n));
+        s->b_chunks = spans(pl.N, weights("FHERMA_B_CHUNKS", in_n));
+        s->c_chunks = spans(pl.N, env_out || std::getenv("FHERMA_C_CHUNKS")
+                                      ? weights("FHERMA_C_CHUNKS", out_n)
+                                      : std::vector<double>{1, 2, 1});   // 2026-10-14: ~15 us better than 1,1
+        s->in_a.resize(s->a_chunks.size());
+        s->in_b.resize(s->b_chunks.size());
+        for (auto* evs : {&s->crt_done, &s->out_done}) evs->resize(s->c_chunks.size());
         for (auto* evs : {&s->in_a, &s->in_b, &s->crt_done, &s->out_done}) {
             for (auto& e : *evs) check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event");
         }
@@ -618,10 +661,11 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     // Mapped: the decompose reads the pinned buffer itself; the launch comes
     // after the host's writes, which is all the ordering it needs.
     auto send = [&](const uint32_t* src, uint32_t* pin, uint32_t* mapped, uint32_t* d_limbs,
-                    uint32_t* d_res, std::vector<cudaEvent_t>& landed) {
-        for (uint32_t ch = 0; ch < s->chunks; ++ch) {
-            const uint32_t k0 = ch * s->chunk;
-            const uint32_t count = std::min(s->chunk, N - k0);
+                    uint32_t* d_res, const std::vector<State::Span>& chunks,
+                    std::vector<cudaEvent_t>& landed) {
+        for (uint32_t ch = 0; ch < chunks.size(); ++ch) {
+            const uint32_t k0 = chunks[ch].k0;
+            const uint32_t count = chunks[ch].count;
             const size_t off = static_cast<size_t>(k0) * L;
             const size_t n = static_cast<size_t>(count) * L * sizeof(uint32_t);
             if (map_in) {
@@ -640,8 +684,8 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
             launch_decompose(*s, d_limbs, d_res, k0, count);
         }
     };
-    send(in.a.data.data(), s->h_a, s->m_a, s->d_la, s->d_A, s->in_a);
-    send(in.b.data.data(), s->h_b, s->m_b, s->d_lb, s->d_B, s->in_b);
+    send(in.a.data.data(), s->h_a, s->m_a, s->d_la, s->d_A, s->a_chunks, s->in_a);
+    send(in.b.data.data(), s->h_b, s->m_b, s->d_lb, s->d_B, s->b_chunks, s->in_b);
     t[1] = HostClock::now();
     if (s->profile) cudaEventRecord(s->prof[1], s->comp);
 
@@ -651,9 +695,9 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     // Out: each chunk's CRT, then its copy back once the CRT is done.
     // Mapped: the CRT writes the pinned buffer itself, and its end is the copy's.
     uint32_t* dst = reg_out ? out.c.data.data() : s->h_c;
-    for (uint32_t ch = 0; ch < s->ochunks; ++ch) {
-        const uint32_t k0 = ch * s->ochunk;
-        const uint32_t count = std::min(s->ochunk, N - k0);
+    for (uint32_t ch = 0; ch < s->c_chunks.size(); ++ch) {
+        const uint32_t k0 = s->c_chunks[ch].k0;
+        const uint32_t count = s->c_chunks[ch].count;
         const size_t off = static_cast<size_t>(k0) * L;
         if (map_out) {
             launch_crt(*s, s->m_c, k0, count);
@@ -676,9 +720,9 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     } else {
         s->helper->wait();
         t[3] = HostClock::now();
-        for (uint32_t ch = 0; ch < s->ochunks; ++ch) {
-            const size_t off = static_cast<size_t>(ch) * s->ochunk * L;
-            const size_t n = std::min(static_cast<size_t>(s->ochunk) * L, words - off);
+        for (uint32_t ch = 0; ch < s->c_chunks.size(); ++ch) {
+            const size_t off = static_cast<size_t>(s->c_chunks[ch].k0) * L;
+            const size_t n = static_cast<size_t>(s->c_chunks[ch].count) * L;
             check(cudaEventSynchronize(s->out_done[ch]), "copy out");
             s->pool->copy(out.c.data.data() + off, s->h_c + off, n * sizeof(uint32_t));
         }
@@ -687,7 +731,7 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     t[4] = HostClock::now();
     if (reg_out) t[3] = t[2];
     if (s->profile) {
-        check(cudaStreamWaitEvent(s->comp, s->out_done[s->ochunks - 1], 0), "wait");
+        check(cudaStreamWaitEvent(s->comp, s->out_done.back(), 0), "wait");
         cudaEventRecord(s->prof[4], s->comp);
         cudaEventSynchronize(s->prof[4]);
         report_profile(*s, t);
