@@ -34,8 +34,9 @@
 
 namespace rns {
 
-constexpr int kMaxL = 32;          // limbs per coefficient (W <= 1024)
-constexpr int kMaxK = 80;          // primes (68 at W = 1024, N = 2^15)
+constexpr int kMaxL = 64;          // limbs per coefficient (W <= 2048)
+constexpr int kMaxK = 160;         // primes (~115 at W = 1747, N = 2^16; ~134 at W = 2048)
+constexpr int kMaxLogN = 22;       // the NTT's row pass needs rows of at most kNttTile
 constexpr int kMarginBits = 20;    // |c| / P < 2^-20: the CRT rounding is exact
 
 // ---------------------------------------------------------------------------

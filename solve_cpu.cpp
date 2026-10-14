@@ -182,10 +182,13 @@ void crt(const State& s, std::vector<uint32_t>& c) {
     const uint32_t blocks = (N + rns::kCrtTile - 1) / rns::kCrtTile;
 #pragma omp parallel for
     for (uint32_t blk = 0; blk < blocks; ++blk) {
-        uint32_t ytile[rns::kCrtTile * rns::kMaxK];
-        uint32_t part[rns::kCrtGroups * (L + 2) * rns::kCrtTile];
-        double fracs[rns::kCrtGroups * rns::kCrtTile];
-        uint32_t tile[rns::kCrtTile * (L + 1)];
+        // The GPU's shared-memory layout, so the CPU run checks it too.
+        std::vector<double> smem((rns::crt_smem_bytes(L, v.K) + sizeof(double) - 1) / sizeof(double));
+        const rns::CrtSmem m = rns::crt_smem(smem.data(), L, v.K);
+        uint32_t* const ytile = m.ytile;
+        uint32_t* const part = m.part;
+        double* const fracs = m.fracs;
+        uint32_t* const tile = m.tile;
         const uint32_t kb = blk * rns::kCrtTile;
         const uint32_t nk = std::min(rns::kCrtTile, N - kb);
         phase(rns::kCrtTile * v.K, [&](uint32_t i) { rns::crt_load(i, ytile, s.A.data(), kb, nk, N); });

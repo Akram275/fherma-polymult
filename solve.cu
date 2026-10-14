@@ -207,10 +207,12 @@ template <int L>
 __global__ void __launch_bounds__(kCrtThreads)
 k_crt(const uint32_t* __restrict__ Y, uint32_t* __restrict__ c,
       uint32_t k0, uint32_t count, uint32_t N, rns::CrtView v) {
-    __shared__ uint32_t ytile[rns::kCrtTile * rns::kMaxK];
-    __shared__ uint32_t part[rns::kCrtGroups * (L + 2) * rns::kCrtTile];
-    __shared__ double fracs[rns::kCrtGroups * rns::kCrtTile];
-    __shared__ uint32_t tile[rns::kCrtTile * (L + 1)];
+    extern __shared__ double crt_shared[];   // rns::crt_smem_bytes(L, K), set at launch
+    const rns::CrtSmem m = rns::crt_smem(crt_shared, L, v.K);
+    uint32_t* const ytile = m.ytile;
+    uint32_t* const part = m.part;
+    double* const fracs = m.fracs;
+    uint32_t* const tile = m.tile;
     const uint32_t kb = k0 + blockIdx.x * rns::kCrtTile;
     const uint32_t nk = min(rns::kCrtTile, k0 + count - kb);
     for (uint32_t i = threadIdx.x; i < rns::kCrtTile * v.K; i += blockDim.x) {
@@ -553,7 +555,8 @@ void launch_crt(State& s, uint32_t* c, uint32_t k0, uint32_t count) {
     const uint32_t blocks = (count + rns::kCrtTile - 1) / rns::kCrtTile;
     rns::with_L(s.t.L, [&](auto Lc) {
         constexpr int L = decltype(Lc)::value;
-        k_crt<L><<<blocks, kCrtThreads, 0, s.comp>>>(s.d_A, c, k0, count, s.t.N, s.crt);
+        k_crt<L><<<blocks, kCrtThreads, rns::crt_smem_bytes(L, s.t.K), s.comp>>>(s.d_A, c, k0, count,
+                                                                                 s.t.N, s.crt);
     });
 }
 
@@ -601,6 +604,22 @@ void* fherma_init(const fherma::Point& p) {
                            upload(*s, pl.scale), upload(*s, pl.scale_s)};
         s->crt = rns::CrtView{pl.K, rns::Modulus{upload(*s, pl.q), pl.L, pl.q_top},
                               upload(*s, pl.p_recip), upload(*s, pl.M), upload(*s, pl.negvP)};
+
+        // The CRT's shared memory grows with L and K (~52 KB at N = 65536, W = 1747):
+        // past the default 48 KB a kernel has to opt in.
+        const size_t crt_bytes = rns::crt_smem_bytes(pl.L, pl.K);
+        int dev = 0, optin = 0;
+        check(cudaGetDevice(&dev), "device");
+        check(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev), "attribute");
+        if (crt_bytes > static_cast<size_t>(optin)) {
+            throw std::runtime_error("CRT needs " + std::to_string(crt_bytes) + " bytes of shared memory, device has " +
+                                     std::to_string(optin));
+        }
+        rns::with_L(pl.L, [&](auto Lc) {
+            constexpr int L = decltype(Lc)::value;
+            check(cudaFuncSetAttribute(k_crt<L>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       static_cast<int>(crt_bytes)), "crt smem");
+        });
 
         const size_t words = static_cast<size_t>(pl.N) * pl.L;
         const size_t residues = static_cast<size_t>(pl.K) * pl.N;

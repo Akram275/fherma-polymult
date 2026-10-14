@@ -5,6 +5,7 @@
 
 #include "rns.cuh"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -103,8 +104,9 @@ inline int bit_length(const std::vector<uint32_t>& x) {
 
 inline Plan make_plan(uint32_t N, const uint32_t* q, int L) {
     using namespace detail;
-    if (N < 2 || (N & (N - 1)) || N > (1u << 15)) {
-        throw std::runtime_error("N must be a power of two in [2, 2^15]; got " + std::to_string(N));
+    if (N < 2 || (N & (N - 1)) || N > (1u << kMaxLogN)) {
+        throw std::runtime_error("N must be a power of two in [2, 2^" + std::to_string(kMaxLogN) +
+                                 "]; got " + std::to_string(N));
     }
     if (L < 1 || L > kMaxL) {
         throw std::runtime_error("L must be in [1, " + std::to_string(kMaxL) + "]; got " + std::to_string(L));
@@ -121,11 +123,17 @@ inline Plan make_plan(uint32_t N, const uint32_t* q, int L) {
     const Modulus mod = pl.modulus();
 
     // |c| < N q^2, and the rounding needs |c| / P < 2^-(margin + 1).
+    // Primes p = 1 (mod step) with 2N | step, so each has a primitive 2N-th root
+    // of unity; step stays 2^16 for N <= 2^15, so smaller points keep their primes.
     const double need_bits = 2.0 * qbits + pl.logN + 1 + kMarginBits;
     double have_bits = 0;
-    const uint32_t step = 1u << 16;
+    const uint32_t step = std::max(2 * N, 1u << 16);
     for (uint32_t c = ((1u << 31) - 1) / step * step + 1; have_bits <= need_bits; c -= step) {
-        if (c < step) throw std::runtime_error("ran out of primes");
+        if (c < step) {
+            throw std::runtime_error("not enough primes p < 2^31 with p = 1 (mod " + std::to_string(step) +
+                                     ") for N = " + std::to_string(N) + ", q of " + std::to_string(qbits) +
+                                     " bits");
+        }
         if (!is_prime(c)) continue;
         pl.p.push_back(c);
         have_bits += std::log2(static_cast<double>(c));

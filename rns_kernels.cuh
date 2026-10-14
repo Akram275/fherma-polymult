@@ -170,6 +170,29 @@ RNS_UNROLL
 //
 // part[(g * (L + 2) + w) * kCrtTile + b] is word w of group g's partial of b.
 
+// The CRT block's shared memory, sized by the point (K up to kMaxK, L up to
+// kMaxL is too much for a static 48 KB): fracs (doubles, first for alignment),
+// ytile, part, then the output tile.
+struct CrtSmem {
+    double* fracs;
+    uint32_t *ytile, *part, *tile;
+};
+
+RNS_HD size_t crt_smem_bytes(int L, int K) {
+    return sizeof(double) * kCrtGroups * kCrtTile +
+           sizeof(uint32_t) * (static_cast<size_t>(kCrtTile) * K + kCrtGroups * (L + 2) * kCrtTile +
+                               kCrtTile * (L + 1));
+}
+
+RNS_HD CrtSmem crt_smem(void* base, int L, int K) {
+    CrtSmem m;
+    m.fracs = static_cast<double*>(base);
+    m.ytile = reinterpret_cast<uint32_t*>(m.fracs + kCrtGroups * kCrtTile);
+    m.part = m.ytile + static_cast<size_t>(kCrtTile) * K;
+    m.tile = m.part + kCrtGroups * (L + 2) * kCrtTile;
+    return m;
+}
+
 RNS_HD void crt_load(uint32_t i, uint32_t* ytile, const uint32_t* Y, uint32_t kb,
                      uint32_t nk, uint32_t N) {
     const uint32_t b = i % kCrtTile, j = i / kCrtTile;
