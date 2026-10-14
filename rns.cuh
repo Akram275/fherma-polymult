@@ -119,6 +119,13 @@ RNS_UNROLL
 // psi^-bitrev(i) (inverse), with psi a primitive 2N-th root of unity, so the
 // negacyclic twist is folded into the transform and no pre/post pass is needed.
 
+// A twiddle and its Shoup companion side by side, so a butterfly fetches both
+// with one 8-byte load (the NTT kernels spent ~16 us of a call on twiddle loads
+// when they were two separate tables).
+struct alignas(8) Twiddle {
+    uint32_t w, ws;
+};
+
 // Forward (Cooley-Tukey): (x, y) -> (x + w y, x - w y).
 RNS_HD void ct_butterfly(uint32_t& x, uint32_t& y, uint32_t w, uint32_t ws, uint32_t p) {
     const uint32_t v = mul_shoup(y, w, ws, p);

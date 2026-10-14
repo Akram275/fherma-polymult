@@ -109,8 +109,7 @@ k_ntt_cols(uint32_t* __restrict__ A, uint32_t* __restrict__ B, rns::Tables t, rn
     const uint32_t r0 = blockIdx.x << g.logC;
     uint32_t* a = A + row;
     uint32_t* b = B ? B + row : nullptr;
-    const uint32_t* w = (kForward ? t.psi : t.ipsi) + row;
-    const uint32_t* ws = (kForward ? t.psi_s : t.ipsi_s) + row;
+    const rns::Twiddle* w = (kForward ? t.psi : t.ipsi) + row;
     const uint32_t p = t.p[j];
 
     for (uint32_t i = threadIdx.x; i < g.T; i += blockDim.x) {
@@ -124,10 +123,10 @@ k_ntt_cols(uint32_t* __restrict__ A, uint32_t* __restrict__ B, rns::Tables t, rn
         for (uint32_t bf = threadIdx.x; bf < g.T / 2; bf += blockDim.x) {
             const rns::Pair pr = rns::col_pair(bf, lt, g);
             if (kForward) {
-                rns::fwd_butterfly(ta, pr, w, ws, p);
-                if (b) rns::fwd_butterfly(tb, pr, w, ws, p);
+                rns::fwd_butterfly(ta, pr, w, p);
+                if (b) rns::fwd_butterfly(tb, pr, w, p);
             } else {
-                rns::inv_butterfly(ta, pr, w, ws, p);
+                rns::inv_butterfly(ta, pr, w, p);
             }
         }
         __syncthreads();
@@ -155,7 +154,7 @@ k_ntt_rows_fwd(uint32_t* __restrict__ A, rns::Tables t, rns::NttGeom g) {
     for (uint32_t s = 0; s < g.logS; ++s) {
         const uint32_t lt = g.logS - 1 - s;
         for (uint32_t bf = threadIdx.x; bf < g.T / 2; bf += blockDim.x) {
-            rns::fwd_butterfly(ta, rns::row_pair(bf, lt, base, g), t.psi + row, t.psi_s + row, p);
+            rns::fwd_butterfly(ta, rns::row_pair(bf, lt, base, g), t.psi + row, p);
         }
         __syncthreads();
     }
@@ -184,8 +183,8 @@ k_ntt_rows_mul(uint32_t* __restrict__ A, const uint32_t* __restrict__ B, rns::Ta
         const uint32_t lt = g.logS - 1 - s;
         for (uint32_t bf = threadIdx.x; bf < g.T / 2; bf += blockDim.x) {
             const rns::Pair pr = rns::row_pair(bf, lt, base, g);
-            if (!kAReady) rns::fwd_butterfly(ta, pr, t.psi + row, t.psi_s + row, p);
-            rns::fwd_butterfly(tb, pr, t.psi + row, t.psi_s + row, p);
+            if (!kAReady) rns::fwd_butterfly(ta, pr, t.psi + row, p);
+            rns::fwd_butterfly(tb, pr, t.psi + row, p);
         }
         __syncthreads();
     }
@@ -195,7 +194,7 @@ k_ntt_rows_mul(uint32_t* __restrict__ A, const uint32_t* __restrict__ B, rns::Ta
     __syncthreads();
     for (uint32_t lt = 0; lt < g.logS; ++lt) {
         for (uint32_t bf = threadIdx.x; bf < g.T / 2; bf += blockDim.x) {
-            rns::inv_butterfly(ta, rns::row_pair(bf, lt, base, g), t.ipsi + row, t.ipsi_s + row, p);
+            rns::inv_butterfly(ta, rns::row_pair(bf, lt, base, g), t.ipsi + row, p);
         }
         __syncthreads();
     }
@@ -598,8 +597,7 @@ void* fherma_init(const fherma::Point& p) {
         s->t = rns::Tables{pl.K, pl.L, pl.N,
                            upload(*s, pl.p), upload(*s, pl.pneg),
                            upload(*s, pl.pow2), upload(*s, pl.pow2_s),
-                           upload(*s, pl.psi), upload(*s, pl.psi_s),
-                           upload(*s, pl.ipsi), upload(*s, pl.ipsi_s),
+                           upload(*s, pl.psi), upload(*s, pl.ipsi),
                            upload(*s, pl.scale), upload(*s, pl.scale_s)};
         s->crt = rns::CrtView{pl.K, rns::Modulus{upload(*s, pl.q), pl.L, pl.q_top},
                               upload(*s, pl.p_recip), upload(*s, pl.M), upload(*s, pl.negvP)};

@@ -30,7 +30,7 @@ struct State {
 rns::Tables tables(const rns::Plan& pl) {
     return rns::Tables{pl.K, pl.L, pl.N,
                        pl.p.data(), pl.pneg.data(), pl.pow2.data(), pl.pow2_s.data(),
-                       pl.psi.data(), pl.psi_s.data(), pl.ipsi.data(), pl.ipsi_s.data(),
+                       pl.psi.data(), pl.ipsi.data(),
                        pl.scale.data(), pl.scale_s.data()};
 }
 
@@ -83,8 +83,7 @@ void ntt_cols(State& s, bool forward, std::vector<uint32_t>& X, std::vector<uint
             uint32_t* a = &X[static_cast<size_t>(j) * t.N];
             uint32_t* b = both ? &(*Y)[static_cast<size_t>(j) * t.N] : nullptr;
             const uint32_t r0 = blk << g.logC;
-            const uint32_t* w = (forward ? t.psi : t.ipsi) + static_cast<size_t>(j) * t.N;
-            const uint32_t* ws = (forward ? t.psi_s : t.ipsi_s) + static_cast<size_t>(j) * t.N;
+            const rns::Twiddle* w = (forward ? t.psi : t.ipsi) + static_cast<size_t>(j) * t.N;
             const uint32_t p = t.p[j];
 
             phase(g.T, [&](uint32_t i) {
@@ -96,10 +95,10 @@ void ntt_cols(State& s, bool forward, std::vector<uint32_t>& X, std::vector<uint
                 stage(g, [&](uint32_t bf) { return rns::col_pair(bf, lt, g); },
                       [&](const rns::Pair& pr) {
                           if (forward) {
-                              rns::fwd_butterfly(ta.data(), pr, w, ws, p);
-                              if (both) rns::fwd_butterfly(tb.data(), pr, w, ws, p);
+                              rns::fwd_butterfly(ta.data(), pr, w, p);
+                              if (both) rns::fwd_butterfly(tb.data(), pr, w, p);
                           } else {
-                              rns::inv_butterfly(ta.data(), pr, w, ws, p);
+                              rns::inv_butterfly(ta.data(), pr, w, p);
                           }
                       });
             }
@@ -132,7 +131,7 @@ void ntt_rows_fwd(State& s) {
                 const uint32_t lt = g.logS - 1 - k;
                 stage(g, [&](uint32_t bf) { return rns::row_pair(bf, lt, base, g); },
                       [&](const rns::Pair& pr) {
-                          rns::fwd_butterfly(ta.data(), pr, t.psi + row, t.psi_s + row, p);
+                          rns::fwd_butterfly(ta.data(), pr, t.psi + row, p);
                       });
             }
             phase(g.T, [&](uint32_t i) { a[i] = ta[i]; });
@@ -160,15 +159,15 @@ void ntt_rows_mul(State& s, bool a_ready) {
                 const uint32_t lt = g.logS - 1 - k;
                 stage(g, [&](uint32_t bf) { return rns::row_pair(bf, lt, base, g); },
                       [&](const rns::Pair& pr) {
-                          if (!a_ready) rns::fwd_butterfly(ta.data(), pr, t.psi + row, t.psi_s + row, p);
-                          rns::fwd_butterfly(tb.data(), pr, t.psi + row, t.psi_s + row, p);
+                          if (!a_ready) rns::fwd_butterfly(ta.data(), pr, t.psi + row, p);
+                          rns::fwd_butterfly(tb.data(), pr, t.psi + row, p);
                       });
             }
             phase(g.T, [&](uint32_t i) { ta[i] = rns::pointwise(ta[i], tb[i], t, j); });
             for (uint32_t lt = 0; lt < g.logS; ++lt) {
                 stage(g, [&](uint32_t bf) { return rns::row_pair(bf, lt, base, g); },
                       [&](const rns::Pair& pr) {
-                          rns::inv_butterfly(ta.data(), pr, t.ipsi + row, t.ipsi_s + row, p);
+                          rns::inv_butterfly(ta.data(), pr, t.ipsi + row, p);
                       });
             }
             phase(g.T, [&](uint32_t i) { a[i] = ta[i]; });

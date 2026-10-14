@@ -21,8 +21,8 @@ struct Plan {
 
     std::vector<uint32_t> p, pneg;            // K; pneg = -p^-1 mod 2^32
     std::vector<uint32_t> pow2, pow2_s;       // K x L: 2^(32 l) mod p_j
-    std::vector<uint32_t> psi, psi_s;         // K x N: psi^bitrev(i)
-    std::vector<uint32_t> ipsi, ipsi_s;       // K x N: psi^-bitrev(i)
+    std::vector<Twiddle> psi;                 // K x N: psi^bitrev(i), with its Shoup companion
+    std::vector<Twiddle> ipsi;                // K x N: psi^-bitrev(i), likewise
     std::vector<uint32_t> scale, scale_s;     // K: N^-1 (P/p_j)^-1 2^32 mod p_j
 
     std::vector<double> p_recip;              // K
@@ -138,9 +138,7 @@ inline Plan make_plan(uint32_t N, const uint32_t* q, int L) {
     pl.pow2.resize(K * L);
     pl.pow2_s.resize(K * L);
     pl.psi.resize(static_cast<size_t>(K) * N);
-    pl.psi_s.resize(static_cast<size_t>(K) * N);
     pl.ipsi.resize(static_cast<size_t>(K) * N);
-    pl.ipsi_s.resize(static_cast<size_t>(K) * N);
     pl.scale.resize(K);
     pl.scale_s.resize(K);
     pl.p_recip.resize(K);
@@ -166,10 +164,9 @@ inline Plan make_plan(uint32_t N, const uint32_t* q, int L) {
         for (uint32_t i = 0; i < N; ++i) {
             const uint32_t e = bitrev(i, pl.logN);
             const size_t at = static_cast<size_t>(j) * N + i;
-            pl.psi[at] = pow_mod(psi, e, p);
-            pl.psi_s[at] = shoup(pl.psi[at], p);
-            pl.ipsi[at] = pow_mod(ipsi, e, p);
-            pl.ipsi_s[at] = shoup(pl.ipsi[at], p);
+            const uint32_t w = pow_mod(psi, e, p), iw = pow_mod(ipsi, e, p);
+            pl.psi[at] = Twiddle{w, shoup(w, p)};
+            pl.ipsi[at] = Twiddle{iw, shoup(iw, p)};
         }
 
         uint64_t Pj = 1;                       // P/p_j mod p_j

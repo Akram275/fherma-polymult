@@ -43,10 +43,8 @@ struct Tables {
     const uint32_t* pneg;
     const uint32_t* pow2;      // K x L
     const uint32_t* pow2_s;
-    const uint32_t* psi;       // K x N
-    const uint32_t* psi_s;
-    const uint32_t* ipsi;
-    const uint32_t* ipsi_s;
+    const Twiddle* psi;        // K x N
+    const Twiddle* ipsi;
     const uint32_t* scale;     // K
     const uint32_t* scale_s;
 };
@@ -106,14 +104,14 @@ RNS_HD Pair row_pair(uint32_t b, uint32_t lt, uint32_t base, const NttGeom& g) {
 }
 
 // Butterflies on a tile, in either pass.
-RNS_HD void fwd_butterfly(uint32_t* tile, const Pair& pr, const uint32_t* w,
-                          const uint32_t* ws, uint32_t p) {
-    ct_butterfly(tile[pr.lo], tile[pr.hi], w[pr.tw], ws[pr.tw], p);
+RNS_HD void fwd_butterfly(uint32_t* tile, const Pair& pr, const Twiddle* tw, uint32_t p) {
+    const Twiddle t = tw[pr.tw];
+    ct_butterfly(tile[pr.lo], tile[pr.hi], t.w, t.ws, p);
 }
 
-RNS_HD void inv_butterfly(uint32_t* tile, const Pair& pr, const uint32_t* w,
-                          const uint32_t* ws, uint32_t p) {
-    gs_butterfly(tile[pr.lo], tile[pr.hi], w[pr.tw], ws[pr.tw], p);
+RNS_HD void inv_butterfly(uint32_t* tile, const Pair& pr, const Twiddle* tw, uint32_t p) {
+    const Twiddle t = tw[pr.tw];
+    gs_butterfly(tile[pr.lo], tile[pr.hi], t.w, t.ws, p);
 }
 
 // Pointwise product for prime j, times N^-1 (P/p_j)^-1 so the inverse NTT
