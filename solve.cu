@@ -205,31 +205,21 @@ k_ntt_rows_mul(uint32_t* __restrict__ A, const uint32_t* __restrict__ B, rns::Ta
     for (uint32_t i = threadIdx.x; i < g.T; i += blockDim.x) a[i] = ta[i];
 }
 
-constexpr uint32_t kCrtThreads = rns::kCrtTile * rns::kCrtGroups;
+constexpr uint32_t kCrtThreads = 32 * rns::kCrtGroups;
 
 template <int L>
 __global__ void __launch_bounds__(kCrtThreads)
 k_crt(const uint32_t* __restrict__ Y, uint32_t* __restrict__ c,
       uint32_t k0, uint32_t count, uint32_t N, rns::CrtView v) {
-    extern __shared__ double crt_shared[];   // rns::crt_smem_bytes(L, K), set at launch
-    const rns::CrtSmem m = rns::crt_smem(crt_shared, L, v.K);
-    uint32_t* const ytile = m.ytile;
-    uint32_t* const part = m.part;
-    double* const fracs = m.fracs;
-    uint32_t* const tile = m.tile;
+    extern __shared__ double crt_shared[];   // rns::crt_smem_bytes(L), set at launch
+    const rns::CrtSmem m = rns::crt_smem(crt_shared);
     const uint32_t kb = k0 + blockIdx.x * rns::kCrtTile;
     const uint32_t nk = min(rns::kCrtTile, k0 + count - kb);
-    for (uint32_t i = threadIdx.x; i < rns::kCrtTile * v.K; i += blockDim.x) {
-        rns::crt_load(i, ytile, Y, kb, nk, N);
-    }
+    rns::crt_columns<L>(threadIdx.x, Y, kb, nk, N, v, m);
     __syncthreads();
-    rns::crt_products<L>(threadIdx.x, ytile, part, fracs, nk, v);
+    if (threadIdx.x < nk) rns::crt_combine<L>(threadIdx.x, v, m);
     __syncthreads();
-    if (threadIdx.x < nk) rns::crt_combine<L>(threadIdx.x, part, fracs, tile, v);
-    __syncthreads();
-    for (uint32_t i = threadIdx.x; i < nk * L; i += blockDim.x) {
-        rns::crt_store(i, tile, c, kb, L);
-    }
+    for (uint32_t i = threadIdx.x; i < nk * L; i += blockDim.x) rns::crt_store<L>(i, m.rows, c, kb);
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +555,7 @@ void launch_crt(State& s, uint32_t* c, uint32_t k0, uint32_t count) {
     const uint32_t blocks = (count + rns::kCrtTile - 1) / rns::kCrtTile;
     rns::with_L(s.t.L, [&](auto Lc) {
         constexpr int L = decltype(Lc)::value;
-        k_crt<L><<<blocks, kCrtThreads, rns::crt_smem_bytes(L, s.t.K), s.comp>>>(s.d_A, c, k0, count,
+        k_crt<L><<<blocks, kCrtThreads, rns::crt_smem_bytes(L), s.comp>>>(s.d_A, c, k0, count,
                                                                                  s.t.N, s.crt);
     });
 }
@@ -619,9 +609,9 @@ void* fherma_init(const fherma::Point& p) {
         s->crt = rns::CrtView{pl.K, rns::Modulus{upload(*s, pl.q), pl.L, pl.q_top},
                               upload(*s, pl.p_recip), upload(*s, pl.M), upload(*s, pl.negvP)};
 
-        // The CRT's shared memory grows with L and K (~52 KB at N = 65536, W = 1747):
-        // past the default 48 KB a kernel has to opt in.
-        const size_t crt_bytes = rns::crt_smem_bytes(pl.L, pl.K);
+        // The CRT's shared memory grows with L (~19 KB at W = 1747); past the default
+        // 48 KB a kernel has to opt in.
+        const size_t crt_bytes = rns::crt_smem_bytes(pl.L);
         int dev = 0, optin = 0;
         check(cudaGetDevice(&dev), "device");
         check(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev), "attribute");

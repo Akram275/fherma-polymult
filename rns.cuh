@@ -208,7 +208,7 @@ RNS_HD int dropped_limbs(int L) { return L > 3 ? L - 3 : 0; }
 // most two subtractions finish.
 //
 // n and L are plain arguments so that a caller with compile-time sizes
-// (crt_finish<L>) gets every loop unrolled and x kept in registers.
+// (crt_combine<L>) gets every loop unrolled and x kept in registers.
 RNS_HD void reduce_wide(uint32_t* x, int n, const uint32_t* q, int L, double q_top) {
     double xd = 0;
 RNS_UNROLL
@@ -236,76 +236,6 @@ struct CrtView {
     const uint32_t* M;         // K x L
     const uint32_t* negvP;     // (K + 1) x L
 };
-
-// The sum is split over groups of primes so that several threads can share one
-// coefficient: crt_partial covers primes [j0, j1), crt_finish adds the groups.
-// L is a template parameter so the accumulators live in registers on the GPU.
-
-// Primes [j0, j1): sum_j y_j * M_j as L + 2 words (< K * 2^31 * q, which fits)
-// into part[w * pstride], and sum_j y_j / p_j into *frac.
-template <int L>
-RNS_HD void crt_partial(const uint32_t* y, uint32_t stride, int j0, int j1, const CrtView& v,
-                        uint32_t* part, uint32_t pstride, double* frac) {
-    double f = 0;
-    for (int j = j0; j < j1; ++j) f += y[j * stride] * v.p_recip[j];
-    *frac = f;
-
-    // Column sums: each product adds < 2^32 to two columns.
-    uint64_t col[L + 2];
-RNS_UNROLL
-    for (int l = 0; l < L + 2; ++l) col[l] = 0;
-    for (int j = j0; j < j1; ++j) {
-        const uint64_t yj = y[j * stride];
-        const uint32_t* Mj = v.M + j * L;
-RNS_UNROLL
-        for (int l = 0; l < L; ++l) {
-            const uint64_t prod = yj * Mj[l];
-            col[l] += static_cast<uint32_t>(prod);
-            col[l + 1] += prod >> 32;
-        }
-    }
-    uint64_t carry = 0;
-RNS_UNROLL
-    for (int l = 0; l < L + 2; ++l) {
-        const uint64_t s = col[l] + carry;
-        part[l * pstride] = static_cast<uint32_t>(s);
-        carry = s >> 32;
-    }
-}
-
-// One output coefficient from G partials (group g at part + g * gstride, word w
-// at + w * pstride; its frac at fracs[g * fstride]).
-template <int L>
-RNS_HD void crt_finish(const uint32_t* part, uint32_t pstride, uint32_t gstride, int G,
-                       const double* fracs, uint32_t fstride, const CrtView& v, uint32_t* out) {
-    const int K = v.K;
-    double frac = 0;
-    for (int g = 0; g < G; ++g) frac += fracs[g * fstride];
-    int vi = static_cast<int>(floor(frac + 0.5));
-    vi = vi < 0 ? 0 : (vi > K ? K : vi);
-
-    uint64_t col[L + 2];
-    const uint32_t* t = v.negvP + vi * L;
-RNS_UNROLL
-    for (int l = 0; l < L + 2; ++l) col[l] = l < L ? t[l] : 0;
-    for (int g = 0; g < G; ++g) {
-RNS_UNROLL
-        for (int l = 0; l < L + 2; ++l) col[l] += part[g * gstride + l * pstride];
-    }
-
-    // < K * 2^31 * q + q < 2^(32 (L + 2)): L + 2 limbs.
-    uint32_t x[L + 2];
-    uint64_t carry = 0;
-RNS_UNROLL
-    for (int l = 0; l < L + 2; ++l) {
-        const uint64_t s = col[l] + carry;
-        x[l] = static_cast<uint32_t>(s);
-        carry = s >> 32;
-    }
-    reduce_wide(x, L + 2, v.mod.q, L, v.mod.q_top);
-RNS_UNROLL
-    for (int l = 0; l < L; ++l) out[l] = x[l];
-}
 
 // Calls f(std::integral_constant<int, L>{}) for a run-time L in [1, kMaxL]:
 // the bridge from the point's L to the CRT templates. Host only.

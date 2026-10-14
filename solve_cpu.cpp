@@ -189,19 +189,13 @@ void crt(const State& s, std::vector<uint32_t>& c) {
 #pragma omp parallel for
     for (uint32_t blk = 0; blk < blocks; ++blk) {
         // The GPU's shared-memory layout, so the CPU run checks it too.
-        std::vector<double> smem((rns::crt_smem_bytes(L, v.K) + sizeof(double) - 1) / sizeof(double));
-        const rns::CrtSmem m = rns::crt_smem(smem.data(), L, v.K);
-        uint32_t* const ytile = m.ytile;
-        uint32_t* const part = m.part;
-        double* const fracs = m.fracs;
-        uint32_t* const tile = m.tile;
+        std::vector<double> smem((rns::crt_smem_bytes(L) + sizeof(double) - 1) / sizeof(double));
+        const rns::CrtSmem m = rns::crt_smem(smem.data());
         const uint32_t kb = blk * rns::kCrtTile;
         const uint32_t nk = std::min(rns::kCrtTile, N - kb);
-        phase(rns::kCrtTile * v.K, [&](uint32_t i) { rns::crt_load(i, ytile, s.A.data(), kb, nk, N); });
-        phase(rns::kCrtTile * rns::kCrtGroups,
-              [&](uint32_t i) { rns::crt_products<L>(i, ytile, part, fracs, nk, v); });
-        phase(nk, [&](uint32_t b) { rns::crt_combine<L>(b, part, fracs, tile, v); });
-        phase(nk * L, [&](uint32_t i) { rns::crt_store(i, tile, c.data(), kb, L); });
+        phase(32 * rns::kCrtGroups, [&](uint32_t i) { rns::crt_columns<L>(i, s.A.data(), kb, nk, N, v, m); });
+        phase(nk, [&](uint32_t k) { rns::crt_combine<L>(k, v, m); });
+        phase(nk * L, [&](uint32_t i) { rns::crt_store<L>(i, m.rows, c.data(), kb); });
     }
 }
 

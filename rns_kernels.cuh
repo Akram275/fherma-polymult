@@ -15,7 +15,7 @@
 //   ntt_rows          A and B fwd stages t < S, pointwise, A inv stages t < S
 //   ntt_cols    inv   A, stages t >= S
 //   crt               K x N residues -> limbs         block: kCrtTile coefficients,
-//                                                           kCrtGroups threads each
+//                                                           kCrtGroups warps (limb ranges)
 //
 // The NTT is split at S = 2^ceil(logN / 2) (S = N for N <= 2048): the stages
 // whose butterflies span t >= S pair elements in the same residue class mod S
@@ -31,8 +31,13 @@ namespace rns {
 constexpr uint32_t kNttTile = 2048;   // elements per NTT block (8 KB per operand)
 constexpr uint32_t kDecPer = 4;                // coefficients per decompose thread
 constexpr uint32_t kDecTile = 32 * kDecPer;    // coefficients per decompose block
-constexpr uint32_t kCrtTile = 32;     // coefficients per CRT block (one warp)
-constexpr uint32_t kCrtGroups = 4;    // prime groups: CRT block = kCrtTile * kCrtGroups threads
+// Coefficients per CRT thread. Measured (kernel time per chunk at N = 32768, W = 868 /
+// N = 65536, W = 1747): 2 per thread 31.5 / 53.6 us, 1 per thread 15.9 / 50.0 us,
+// 1 per thread with the prime loop unrolled by 4: 13.1 / 50.1 us (the old split by
+// prime groups: 11.9 / ~170 us). More blocks matter more than reusing M entries.
+constexpr uint32_t kCrtPer = 1;
+constexpr uint32_t kCrtTile = 32 * kCrtPer;    // coefficients per CRT block
+constexpr uint32_t kCrtGroups = 4;             // limb groups = warps per CRT block
 
 // Device-side views of the Plan tables (pointers into device memory on the GPU,
 // into the Plan's vectors on the CPU).
@@ -208,71 +213,152 @@ RNS_UNROLL
 }
 
 // --- crt -------------------------------------------------------------------
-// A block handles coefficients kb .. kb + nk - 1 (nk <= kCrtTile), with the K
-// primes split into kCrtGroups groups, so each coefficient has kCrtGroups
-// threads for the products and a chunk of the output keeps the GPU busy.
-// Phase 1 (items: kCrtTile * K)          residue (j, kb + b) to ytile[j * kCrtTile + b]:
-//                                        consecutive items are consecutive b, so
-//                                        reads coalesce, all loads in flight at once.
-// Phase 2 (items: kCrtTile * kCrtGroups) item (g, b): the partial of coefficient b
-//                                        over prime group g. A warp is one g and all
-//                                        b, so its M loads are uniform and its smem
-//                                        accesses are consecutive words.
-// Phase 3 (items: nk)                    coefficient b from its partials, into a
-//                                        padded tile.
-// Phase 4 (items: nk * L)                the tile out to c, contiguous, so writes coalesce.
+// A block handles coefficients kb .. kb + nk - 1 (nk <= kCrtTile) with
+// kCrtGroups warps. Warp g owns the output limbs [l0, l0 + span) of
+//     sum_j y_j M_j        (span = ceil(L / kCrtGroups), l0 = g span)
+// for all of the block's coefficients, and the rounding sum sum_j y_j / p_j over
+// the primes j = g (mod kCrtGroups). Lane i takes coefficients i, i + 32, ...:
+// each M entry it loads (uniform across the warp) serves kCrtPer products, and
+// its y loads are 32 consecutive coefficients of one prime, so they coalesce.
+// Splitting by limbs rather than by primes keeps each partial to span + 2 words,
+// so the block's shared memory no longer grows with K (~10 KB at L = 55).
 //
-// part[(g * (L + 2) + w) * kCrtTile + b] is word w of group g's partial of b.
+// Phase 1 (items: 32 kCrtGroups)  item (g, lane): its column sums, carried to
+//                                 span + 2 words, into row k at offset g (span + 2),
+//                                 and its partial rounding sums into fracs.
+// Phase 2 (items: nk)             coefficient k: the partials plus -vP mod q,
+//                                 reduced mod q, written over row k.
+// Phase 3 (items: nk * L)         the rows out to c, contiguous, so writes coalesce.
+// Rows have an odd stride, so the lanes of a warp hit distinct banks.
 
-// The CRT block's shared memory, sized by the point (K up to kMaxK, L up to
-// kMaxL is too much for a static 48 KB): fracs (doubles, first for alignment),
-// ytile, part, then the output tile.
-struct CrtSmem {
-    double* fracs;
-    uint32_t *ytile, *part, *tile;
-};
+RNS_HD constexpr int crt_span(int L) { return (L + static_cast<int>(kCrtGroups) - 1) / static_cast<int>(kCrtGroups); }
 
-RNS_HD size_t crt_smem_bytes(int L, int K) {
-    return sizeof(double) * kCrtGroups * kCrtTile +
-           sizeof(uint32_t) * (static_cast<size_t>(kCrtTile) * K + kCrtGroups * (L + 2) * kCrtTile +
-                               kCrtTile * (L + 1));
+RNS_HD constexpr int crt_stride(int L) {
+    return (static_cast<int>(kCrtGroups) * (crt_span(L) + 2) > L + 1 ? static_cast<int>(kCrtGroups) * (crt_span(L) + 2)
+                                                                      : L + 1) | 1;
 }
 
-RNS_HD CrtSmem crt_smem(void* base, int L, int K) {
+// fracs (kCrtGroups x kCrtTile doubles, first for alignment), then kCrtTile rows.
+struct CrtSmem {
+    double* fracs;
+    uint32_t* rows;
+};
+
+RNS_HD size_t crt_smem_bytes(int L) {
+    return sizeof(double) * kCrtGroups * kCrtTile + sizeof(uint32_t) * static_cast<size_t>(kCrtTile) * crt_stride(L);
+}
+
+RNS_HD CrtSmem crt_smem(void* base) {
     CrtSmem m;
     m.fracs = static_cast<double*>(base);
-    m.ytile = reinterpret_cast<uint32_t*>(m.fracs + kCrtGroups * kCrtTile);
-    m.part = m.ytile + static_cast<size_t>(kCrtTile) * K;
-    m.tile = m.part + kCrtGroups * (L + 2) * kCrtTile;
+    m.rows = reinterpret_cast<uint32_t*>(m.fracs + kCrtGroups * kCrtTile);
     return m;
 }
 
-RNS_HD void crt_load(uint32_t i, uint32_t* ytile, const uint32_t* Y, uint32_t kb,
-                     uint32_t nk, uint32_t N) {
-    const uint32_t b = i % kCrtTile, j = i / kCrtTile;
-    if (b < nk) ytile[i] = Y[static_cast<size_t>(j) * N + kb + b];
+template <int L>
+RNS_HD void crt_columns(uint32_t i, const uint32_t* Y, uint32_t kb, uint32_t nk, uint32_t N,
+                        const CrtView& v, const CrtSmem& m) {
+    constexpr int span = crt_span(L), stride = crt_stride(L);
+    const uint32_t lane = i % 32, g = i / 32;
+    const int l0 = static_cast<int>(g) * span;
+    const int n = L - l0 < span ? L - l0 : span;    // this group's limbs (<= 0: none)
+
+    // Each product adds < 2^32 to two columns: K <= kMaxK keeps a column < 2^41.
+    uint64_t col[kCrtPer][span + 1];
+    double f[kCrtPer];
+RNS_UNROLL
+    for (uint32_t c = 0; c < kCrtPer; ++c) {
+        f[c] = 0;
+RNS_UNROLL
+        for (int w = 0; w <= span; ++w) col[c][w] = 0;
+    }
+    // Unrolled so several primes' y loads are in flight: each iteration starts
+    // with a global load and has little arithmetic to hide it behind.
+#ifdef __CUDA_ARCH__
+#pragma unroll 4
+#endif
+    for (int j = 0; j < v.K; ++j) {
+        uint32_t y[kCrtPer];
+RNS_UNROLL
+        for (uint32_t c = 0; c < kCrtPer; ++c) {
+            const uint32_t k = lane + 32 * c;
+            y[c] = k < nk ? Y[static_cast<size_t>(j) * N + kb + k] : 0;
+        }
+        if (j % static_cast<int>(kCrtGroups) == static_cast<int>(g)) {
+            const double r = v.p_recip[j];
+RNS_UNROLL
+            for (uint32_t c = 0; c < kCrtPer; ++c) f[c] += y[c] * r;
+        }
+RNS_UNROLL
+        for (int w = 0; w < span; ++w) {
+            if (w < n) {
+                const uint64_t mw = v.M[static_cast<size_t>(j) * L + l0 + w];
+RNS_UNROLL
+                for (uint32_t c = 0; c < kCrtPer; ++c) {
+                    const uint64_t prod = y[c] * mw;
+                    col[c][w] += static_cast<uint32_t>(prod);
+                    col[c][w + 1] += prod >> 32;
+                }
+            }
+        }
+    }
+RNS_UNROLL
+    for (uint32_t c = 0; c < kCrtPer; ++c) {
+        const uint32_t k = lane + 32 * c;
+        if (k >= nk) continue;
+        uint32_t* row = m.rows + k * stride + g * (span + 2);
+        uint64_t carry = 0;
+RNS_UNROLL
+        for (int w = 0; w < span + 2; ++w) {
+            const uint64_t s = (w <= span ? col[c][w] : 0) + carry;
+            row[w] = static_cast<uint32_t>(s);
+            carry = s >> 32;
+        }
+        m.fracs[g * kCrtTile + k] = f[c];
+    }
+}
+
+// The exact centred coefficient is c = sum_j y_j (P/p_j) - v P with
+// v = round(sum_j y_j / p_j) (see CrtView); mod q that is sum_j y_j M_j + negvP_v.
+template <int L>
+RNS_HD void crt_combine(uint32_t k, const CrtView& v, const CrtSmem& m) {
+    constexpr int span = crt_span(L), stride = crt_stride(L);
+    double frac = 0;
+RNS_UNROLL
+    for (uint32_t g = 0; g < kCrtGroups; ++g) frac += m.fracs[g * kCrtTile + k];
+    int vi = static_cast<int>(floor(frac + 0.5));
+    vi = vi < 0 ? 0 : (vi > v.K ? v.K : vi);
+
+    uint32_t* row = m.rows + k * stride;
+    const uint32_t* t = v.negvP + vi * L;
+    uint64_t col[L + 2];
+RNS_UNROLL
+    for (int l = 0; l < L + 2; ++l) col[l] = l < L ? t[l] : 0;
+    // Group g's words sit at limbs g span .. g span + span + 1; any past L + 1 are 0.
+RNS_UNROLL
+    for (int g = 0; g < static_cast<int>(kCrtGroups); ++g) {
+RNS_UNROLL
+        for (int w = 0; w < span + 2; ++w) {
+            if (g * span + w < L + 2) col[g * span + w] += row[g * (span + 2) + w];
+        }
+    }
+    // < K * 2^31 * q + q < 2^(32 (L + 2)): L + 2 limbs.
+    uint32_t x[L + 2];
+    uint64_t carry = 0;
+RNS_UNROLL
+    for (int l = 0; l < L + 2; ++l) {
+        const uint64_t s = col[l] + carry;
+        x[l] = static_cast<uint32_t>(s);
+        carry = s >> 32;
+    }
+    reduce_wide(x, L + 2, v.mod.q, L, v.mod.q_top);
+RNS_UNROLL
+    for (int l = 0; l < L; ++l) row[l] = x[l];   // all of row k was read above
 }
 
 template <int L>
-RNS_HD void crt_products(uint32_t i, const uint32_t* ytile, uint32_t* part, double* fracs,
-                         uint32_t nk, const CrtView& v) {
-    const uint32_t b = i % kCrtTile, g = i / kCrtTile;
-    if (b >= nk) return;
-    const int j0 = static_cast<int>(g * v.K / kCrtGroups);
-    const int j1 = static_cast<int>((g + 1) * v.K / kCrtGroups);
-    crt_partial<L>(ytile + b, kCrtTile, j0, j1, v,
-                   part + g * (L + 2) * kCrtTile + b, kCrtTile, fracs + g * kCrtTile + b);
-}
-
-template <int L>
-RNS_HD void crt_combine(uint32_t b, const uint32_t* part, const double* fracs, uint32_t* tile,
-                        const CrtView& v) {
-    crt_finish<L>(part + b, kCrtTile, (L + 2) * kCrtTile, kCrtGroups, fracs + b, kCrtTile, v,
-                  tile + b * (L + 1));
-}
-
-RNS_HD void crt_store(uint32_t i, const uint32_t* tile, uint32_t* c, uint32_t kb, int L) {
-    c[static_cast<size_t>(kb) * L + i] = tile[(i / L) * (L + 1) + i % L];
+RNS_HD void crt_store(uint32_t i, const uint32_t* rows, uint32_t* c, uint32_t kb) {
+    c[static_cast<size_t>(kb) * L + i] = rows[(i / L) * crt_stride(L) + i % L];
 }
 
 }  // namespace rns
