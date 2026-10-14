@@ -29,7 +29,8 @@
 namespace rns {
 
 constexpr uint32_t kNttTile = 2048;   // elements per NTT block (8 KB per operand)
-constexpr uint32_t kDecTile = 32;     // coefficients per decompose block
+constexpr uint32_t kDecPer = 4;                // coefficients per decompose thread
+constexpr uint32_t kDecTile = 32 * kDecPer;    // coefficients per decompose block
 constexpr uint32_t kCrtTile = 32;     // coefficients per CRT block (one warp)
 constexpr uint32_t kCrtGroups = 4;    // prime groups: CRT block = kCrtTile * kCrtGroups threads
 
@@ -126,20 +127,32 @@ RNS_HD uint32_t pointwise(uint32_t a, uint32_t b, const Tables& t, int j) {
 // A block handles coefficients kb .. kb + nk - 1 (nk <= kDecTile), all primes.
 // Phase 1 (items: nk * L)   copies the limbs to a padded tile, row stride L + 1
 //                           (odd, so the phase 2 reads are bank-conflict free).
-// Phase 2 (items: kDecTile * K) writes residue (j, k): consecutive items are
-//                           consecutive k for one prime, so writes coalesce.
+// Phase 2 (items: 32 * K)   item (j, lane) writes residues (j, lane + 32 c) for
+//                           c < kDecPer: one prime's table entries serve kDecPer
+//                           coefficients, and each of a warp's kDecPer stores is
+//                           32 consecutive coefficients of one prime, so they coalesce.
 
-RNS_HD void dec_load(uint32_t i, uint32_t* tile, const uint32_t* limbs, uint32_t kb, int L) {
+// L is a template parameter (dispatched with with_L, like the CRT): the limb
+// loop unrolls and i / L, i % L are divisions by a constant.
+template <int L>
+RNS_HD void dec_load(uint32_t i, uint32_t* tile, const uint32_t* limbs, uint32_t kb) {
     tile[(i / L) * (L + 1) + i % L] = limbs[static_cast<size_t>(kb) * L + i];
 }
 
+template <int L>
 RNS_HD void dec_compute(uint32_t b, const uint32_t* tile, uint32_t* res,
                         uint32_t kb, uint32_t nk, const Tables& t) {
-    const uint32_t kk = b % kDecTile, j = b / kDecTile;
-    if (kk >= nk) return;
-    const int L = t.L;
-    res[static_cast<size_t>(j) * t.N + kb + kk] =
-        decompose_one(tile + kk * (L + 1), L, t.pow2 + j * L, t.pow2_s + j * L, t.p[j]);
+    const uint32_t lane = b % 32, j = b / 32;
+    if (lane >= nk) return;
+    // Rows past nk are unset: computed from whatever is there, never stored.
+    uint32_t r[kDecPer];
+    decompose_many<L, kDecPer>([&](int c) { return tile + (lane + 32 * c) * (L + 1); },
+                               t.pow2 + j * L, t.pow2_s + j * L, t.p[j], r);
+    uint32_t* out = res + static_cast<size_t>(j) * t.N + kb + lane;
+RNS_UNROLL
+    for (uint32_t c = 0; c < kDecPer; ++c) {
+        if (lane + 32 * c < nk) out[32 * c] = r[c];
+    }
 }
 
 // --- crt -------------------------------------------------------------------

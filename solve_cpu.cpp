@@ -54,16 +54,17 @@ void stage(const rns::NttGeom& g, PairOf pair_of, Butterfly butterfly) {
     });
 }
 
+template <int L>
 void decompose(const State& s, const std::vector<uint32_t>& limbs, std::vector<uint32_t>& res) {
     const rns::Tables& t = s.t;
     const uint32_t blocks = (t.N + rns::kDecTile - 1) / rns::kDecTile;
 #pragma omp parallel for
     for (uint32_t blk = 0; blk < blocks; ++blk) {
-        uint32_t tile[rns::kDecTile * (rns::kMaxL + 1)];
+        uint32_t tile[rns::kDecTile * (L + 1)] = {};   // rows past nk are read, never stored
         const uint32_t kb = blk * rns::kDecTile;
         const uint32_t nk = std::min(rns::kDecTile, t.N - kb);
-        phase(nk * t.L, [&](uint32_t i) { rns::dec_load(i, tile, limbs.data(), kb, t.L); });
-        phase(rns::kDecTile * t.K, [&](uint32_t b) { rns::dec_compute(b, tile, res.data(), kb, nk, t); });
+        phase(nk * L, [&](uint32_t i) { rns::dec_load<L>(i, tile, limbs.data(), kb); });
+        phase(32 * t.K, [&](uint32_t b) { rns::dec_compute<L>(b, tile, res.data(), kb, nk, t); });
     }
 }
 
@@ -213,8 +214,10 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     const uint32_t N = s->t.N;
     const int L = s->t.L;
 
-    decompose(*s, in.a.data, s->A);
-    decompose(*s, in.b.data, s->B);
+    rns::with_L(L, [&](auto Lc) {
+        decompose<decltype(Lc)::value>(*s, in.a.data, s->A);
+        decompose<decltype(Lc)::value>(*s, in.b.data, s->B);
+    });
     // The GPU order: a's forward transform while b is still arriving, then b's.
     ntt_cols(*s, /*forward=*/true, s->A, nullptr);
     ntt_rows_fwd(*s);

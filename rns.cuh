@@ -66,6 +66,11 @@ RNS_HD uint32_t mul_shoup(uint32_t a, uint32_t w, uint32_t ws, uint32_t p) {
     return r >= p ? r - p : r;
 }
 
+// mul_shoup without its final correction: a * w mod p plus 0 or p, below 2p.
+RNS_HD uint32_t mul_shoup_lazy(uint32_t a, uint32_t w, uint32_t ws, uint32_t p) {
+    return a * w - mulhi(a, ws) * p;
+}
+
 // Montgomery product a*b*2^-32 mod p, for a, b < p. pneg = -p^-1 mod 2^32.
 RNS_HD uint32_t mont_mul(uint32_t a, uint32_t b, uint32_t p, uint32_t pneg) {
     const uint64_t t = static_cast<uint64_t>(a) * b;          // < 2^62
@@ -75,16 +80,38 @@ RNS_HD uint32_t mont_mul(uint32_t a, uint32_t b, uint32_t p, uint32_t pneg) {
 }
 
 // ---------------------------------------------------------------------------
-// Step 1: one coefficient's residue mod p, as sum_l limb_l * (2^(32 l) mod p).
-
-RNS_HD uint32_t decompose_one(const uint32_t* limbs, int L,
-                              const uint32_t* pow2, const uint32_t* pow2_s,
-                              uint32_t p) {
-    uint32_t acc = 0;
+// Step 1: a coefficient's residue mod p, as sum_l limb_l * (2^(32 l) mod p).
+//
+// C coefficients per call, all for the same prime, so each table entry loaded
+// serves C terms: the kernel was bound by its two table loads per term (58 global
+// loads per residue against 101 multiplies), not by its arithmetic.
+// limbs(c) gives coefficient c's limbs; out[c] gets its residue.
+//
+// Lazily: each term is reduced only to below 2p, the terms are summed in 64
+// bits (< 2^37 for L <= 32), and the sum hi * 2^32 + lo is reduced once, as
+// lo * 1 + hi * (2^32 mod p), with pow2[0] = 1 and pow2[1] = 2^32 mod p and
+// their Shoup companions.
+//
+// L is a template parameter so the loops unroll and the accumulators stay in
+// registers.
+template <int L, int C, class Limbs>
+RNS_HD void decompose_many(Limbs limbs, const uint32_t* pow2, const uint32_t* pow2_s, uint32_t p,
+                           uint32_t (&out)[C]) {
+    uint64_t acc[C];
+RNS_UNROLL
+    for (int c = 0; c < C; ++c) acc[c] = 0;
+RNS_UNROLL
     for (int l = 0; l < L; ++l) {
-        acc = add_mod(acc, mul_shoup(limbs[l], pow2[l], pow2_s[l], p), p);
+        const uint32_t w = pow2[l], ws = pow2_s[l];
+RNS_UNROLL
+        for (int c = 0; c < C; ++c) acc[c] += mul_shoup_lazy(limbs(c)[l], w, ws, p);
     }
-    return acc;
+RNS_UNROLL
+    for (int c = 0; c < C; ++c) {
+        const uint32_t lo = mul_shoup(static_cast<uint32_t>(acc[c]), pow2[0], pow2_s[0], p);
+        out[c] = L == 1 ? lo   // acc < 2p: no high word
+                        : add_mod(lo, mul_shoup(static_cast<uint32_t>(acc[c] >> 32), pow2[L > 1], pow2_s[L > 1], p), p);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -77,18 +77,24 @@ void check(cudaError_t e, const char* what) {
 // ---------------------------------------------------------------------------
 // Kernels. Each loop is one phase of rns_kernels.cuh, dealt out to the block.
 
-__global__ void __launch_bounds__(kThreads)
+// More threads than the other kernels: with 256, an SM had too few warps to
+// hide the latency of phase 2's long per-thread sums (measured at N = 32768,
+// kDecPer 4: 256 threads 15.4 us, 512 12.2 us, 1024 12.2 us per half operand).
+constexpr int kDecThreads = 512;
+
+template <int L>
+__global__ void __launch_bounds__(kDecThreads)
 k_decompose(const uint32_t* __restrict__ limbs, uint32_t* __restrict__ res,
             uint32_t k0, uint32_t count, rns::Tables t) {
-    __shared__ uint32_t tile[rns::kDecTile * (rns::kMaxL + 1)];
+    __shared__ uint32_t tile[rns::kDecTile * (L + 1)];
     const uint32_t kb = k0 + blockIdx.x * rns::kDecTile;
     const uint32_t nk = min(rns::kDecTile, k0 + count - kb);
-    for (uint32_t i = threadIdx.x; i < nk * t.L; i += blockDim.x) {
-        rns::dec_load(i, tile, limbs, kb, t.L);
+    for (uint32_t i = threadIdx.x; i < nk * L; i += blockDim.x) {
+        rns::dec_load<L>(i, tile, limbs, kb);
     }
     __syncthreads();
-    for (uint32_t b = threadIdx.x; b < rns::kDecTile * t.K; b += blockDim.x) {
-        rns::dec_compute(b, tile, res, kb, nk, t);
+    for (uint32_t b = threadIdx.x; b < 32 * t.K; b += blockDim.x) {
+        rns::dec_compute<L>(b, tile, res, kb, nk, t);
     }
 }
 
@@ -518,7 +524,10 @@ struct Registration {
 
 void launch_decompose(State& s, const uint32_t* limbs, uint32_t* res, uint32_t k0, uint32_t count) {
     const uint32_t blocks = (count + rns::kDecTile - 1) / rns::kDecTile;
-    k_decompose<<<blocks, kThreads, 0, s.comp>>>(limbs, res, k0, count, s.t);
+    rns::with_L(s.t.L, [&](auto Lc) {
+        constexpr int L = decltype(Lc)::value;
+        k_decompose<L><<<blocks, kDecThreads, 0, s.comp>>>(limbs, res, k0, count, s.t);
+    });
 }
 
 // a's forward transform, enqueued right after a's decompose so it runs while
