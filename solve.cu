@@ -49,6 +49,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -320,6 +321,72 @@ private:
     size_t n_ = 0;
 };
 
+// One thread for one background job per call (sizing the output vector while
+// the calling thread copies the inputs), spinning and sleeping like CopyPool.
+class Helper {
+public:
+    explicit Helper(int spin_ms) : spin_(std::chrono::milliseconds(spin_ms)), thread_([this] { work(); }) {}
+    ~Helper() {
+        {
+            std::lock_guard<std::mutex> g(m_);
+            quit_.store(true);
+        }
+        cv_.notify_all();
+        thread_.join();
+    }
+
+    // Starts fn on the helper. The caller must wait() before starting another.
+    void run(std::function<void()> fn) {
+        job_ = std::move(fn);
+        {
+            std::lock_guard<std::mutex> g(m_);
+            pending_.store(true, std::memory_order_release);
+        }
+        cv_.notify_all();
+    }
+    void wait() {
+        while (pending_.load(std::memory_order_acquire)) pause();
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+
+    static void pause() {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
+
+    void work() {
+        auto idle_since = Clock::now();
+        for (;;) {
+            if (pending_.load(std::memory_order_acquire)) {
+                job_();
+                job_ = nullptr;
+                idle_since = Clock::now();
+                pending_.store(false, std::memory_order_release);
+                continue;
+            }
+            if (quit_.load()) return;
+            if (Clock::now() < idle_since + spin_) {
+                pause();
+                continue;
+            }
+            std::unique_lock<std::mutex> g(m_);
+            cv_.wait(g, [&] { return quit_.load() || pending_.load(); });
+        }
+    }
+
+    const Clock::duration spin_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::atomic<bool> quit_{false}, pending_{false};
+    std::function<void()> job_;
+    std::thread thread_;   // last: starts after everything it reads
+};
+
 int copy_threads() {
     if (const char* v = std::getenv("FHERMA_THREADS")) return std::max(1, std::atoi(v));
     const int cores = static_cast<int>(std::thread::hardware_concurrency());
@@ -344,6 +411,7 @@ struct State {
     std::vector<cudaEvent_t> in_a, in_b, crt_done, out_done;
     Copy in_mode = Copy::staged, out_mode = Copy::staged;
     std::unique_ptr<CopyPool> pool;
+    std::unique_ptr<Helper> helper;
 
     bool profile = false;
     cudaEvent_t prof[5] = {};
@@ -433,7 +501,9 @@ void* fherma_init(const fherma::Point& p) {
         s->out_mode = copy_mode("FHERMA_OUT");
         s->profile = std::getenv("FHERMA_PROFILE") != nullptr;
         const char* spin = std::getenv("FHERMA_SPIN_MS");
-        s->pool.reset(new CopyPool(copy_threads() - 1, spin ? std::max(0, std::atoi(spin)) : 20));
+        const int spin_ms = spin ? std::max(0, std::atoi(spin)) : 20;
+        s->pool.reset(new CopyPool(copy_threads() - 1, spin_ms));
+        s->helper.reset(new Helper(spin_ms));
 
         s->t = rns::Tables{pl.K, pl.L, pl.N,
                            upload(*s, pl.p), upload(*s, pl.pneg),
@@ -526,6 +596,17 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
         hold.emplace_back(new Registration(out.c.data.data(), bytes));
     }
     s->pool->wake();
+    // Size the answer on the helper while this thread copies the inputs, so the
+    // zero fill (~350 us here) is done before the first output chunk lands.
+    // The guard waits for it however the call ends: it writes into `out`.
+    struct Sized {
+        Helper& h;
+        bool started;
+        ~Sized() {
+            if (started) h.wait();
+        }
+    } sized{*s->helper, !reg_out};
+    if (sized.started) s->helper->run([&out, words] { out.c.data.resize(words); });
     struct Rest {
         CopyPool& p;
         ~Rest() { p.rest(); }
@@ -593,8 +674,7 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     if (reg_out) {
         check(cudaStreamSynchronize(s->d2h), "copy out");
     } else {
-        // Everything is enqueued: size the answer while the GPU works.
-        out.c.data.resize(words);
+        s->helper->wait();
         t[3] = HostClock::now();
         for (uint32_t ch = 0; ch < s->ochunks; ++ch) {
             const size_t off = static_cast<size_t>(ch) * s->ochunk * L;
