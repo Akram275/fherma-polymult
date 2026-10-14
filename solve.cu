@@ -672,6 +672,39 @@ void advise_host(State& s, int slot, const void* p, size_t n) {
     r.n = n;
 }
 
+// The copy modes and everything that depends on them: the chunk layouts (env
+// overrides first) and the per-chunk events. Called again by the autotuning in
+// fherma_init, so it replaces whatever a previous call made.
+void configure(State& s, Copy in, Copy out) {
+    s.in_mode = in;
+    s.out_mode = out;
+    const uint32_t N = s.t.N;
+    // With hmm there is no host copy to overlap, and each chunk boundary
+    // leaves a kernel tail idling the link: one chunk each way is fastest
+    // (N = 65536: GPU span 2242 us with 1/1 against 2404 with 2/1,2,1).
+    const bool hmm = in == Copy::hmm;
+    const char* env_in = std::getenv("FHERMA_CHUNKS");
+    const int in_n = std::max(1, env_in ? std::atoi(env_in) : (hmm ? 1 : 2));
+    const char* env_out = std::getenv("FHERMA_OUT_CHUNKS");
+    const int out_n = env_out ? std::max(1, std::atoi(env_out)) : in_n;
+    s.a_chunks = spans(N, weights("FHERMA_A_CHUNKS", in_n));
+    s.b_chunks = spans(N, weights("FHERMA_B_CHUNKS", in_n));
+    s.c_chunks = spans(N, env_out || std::getenv("FHERMA_C_CHUNKS")
+                              ? weights("FHERMA_C_CHUNKS", out_n)
+                              : out == Copy::hmm ? std::vector<double>{1}
+                                                 : std::vector<double>{1, 2, 1});   // staged: ~15 us better than 1,1
+    for (auto* evs : {&s.in_a, &s.in_b, &s.crt_done, &s.out_done}) {
+        for (auto e : *evs) cudaEventDestroy(e);
+        evs->clear();
+    }
+    s.in_a.resize(s.a_chunks.size());
+    s.in_b.resize(s.b_chunks.size());
+    for (auto* evs : {&s.crt_done, &s.out_done}) evs->resize(s.c_chunks.size());
+    for (auto* evs : {&s.in_a, &s.in_b, &s.crt_done, &s.out_done}) {
+        for (auto& e : *evs) check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event");
+    }
+}
+
 }  // namespace
 
 void* fherma_init(const fherma::Point& p) {
@@ -767,37 +800,66 @@ void* fherma_init(const fherma::Point& p) {
         check(cudaEventCreateWithFlags(&s->a_ready, cudaEventDisableTiming), "event");
         check(cudaEventCreateWithFlags(&s->a_ntt_done, cudaEventDisableTiming), "event");
 
-        // With hmm there is no host copy to overlap, and each chunk boundary
-        // leaves a kernel tail idling the link: one chunk each way is fastest
-        // (N = 65536: GPU span 2242 us with 1/1 against 2404 with 2/1,2,1).
-        const bool hmm = s->in_mode == Copy::hmm;
-        const char* env_in = std::getenv("FHERMA_CHUNKS");
-        const int in_n = std::max(1, env_in ? std::atoi(env_in) : (hmm ? 1 : 2));
-        const char* env_out = std::getenv("FHERMA_OUT_CHUNKS");
-        const int out_n = env_out ? std::max(1, std::atoi(env_out)) : in_n;
-        s->a_chunks = spans(pl.N, weights("FHERMA_A_CHUNKS", in_n));
-        s->b_chunks = spans(pl.N, weights("FHERMA_B_CHUNKS", in_n));
-        s->c_chunks = spans(pl.N, env_out || std::getenv("FHERMA_C_CHUNKS")
-                                      ? weights("FHERMA_C_CHUNKS", out_n)
-                                      : s->out_mode == Copy::hmm
-                                            ? std::vector<double>{1}
-                                            : std::vector<double>{1, 2, 1});   // staged: ~15 us better than 1,1
-        s->in_a.resize(s->a_chunks.size());
-        s->in_b.resize(s->b_chunks.size());
-        for (auto* evs : {&s->crt_done, &s->out_done}) evs->resize(s->c_chunks.size());
-        for (auto* evs : {&s->in_a, &s->in_b, &s->crt_done, &s->out_done}) {
-            for (auto& e : *evs) check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event");
-        }
         for (auto& e : s->prof) check(cudaEventCreate(&e), "event");
 
-        // One untimed run, so nothing the first case pays for is a first time.
+        // Dummy operands (any limbs do for timing; the setup never sees a or b).
         fherma::Inputs warm;
         warm.a.shape = warm.b.shape = {static_cast<int64_t>(pl.N), static_cast<int64_t>(pl.L)};
-        warm.a.data.assign(words, 0);
-        warm.b.data.assign(words, 0);
+        warm.a.data.resize(words);
+        warm.b.data.resize(words);
+        for (size_t i = 0; i < words; ++i) {
+            warm.a.data[i] = static_cast<uint32_t>(i * 2654435761u) >> 1;
+            warm.b.data[i] = static_cast<uint32_t>(i * 2246822519u) >> 1;
+        }
         const bool profile = s->profile;
         s->profile = false;
-        fherma_run(s, warm);
+
+        // Which copy mode wins depends on the machine (HMM or not, its rate, the
+        // host's memory bandwidth), so unless FHERMA_IN / FHERMA_OUT pick one, time
+        // the candidates here on the dummy operands and keep the fastest.
+        // FHERMA_AUTOTUNE=0 skips this and uses the defaults (hmm where possible).
+        std::vector<std::pair<Copy, Copy>> candidates{{s->in_mode, s->out_mode}};
+        const char* at = std::getenv("FHERMA_AUTOTUNE");
+        const bool tune = !std::getenv("FHERMA_IN") && !std::getenv("FHERMA_OUT") && !(at && !std::strcmp(at, "0"));
+        if (tune && s->in_mode == Copy::hmm) {
+            candidates.push_back({Copy::staged, Copy::staged});
+            candidates.push_back({Copy::hmm, Copy::staged});
+        }
+        double best = 1e30;
+        std::pair<Copy, Copy> pick = candidates[0];
+        std::vector<char> flush(candidates.size() > 1 ? 4 * words * sizeof(uint32_t) : 0);
+        for (const auto& c : candidates) {
+            configure(*s, c.first, c.second);
+            fherma_run(s, warm);                     // first use of this mode, untimed
+            if (candidates.size() == 1) break;
+            std::vector<double> t;
+            for (int r = 0; r < 7; ++r) {
+                // Between real cases main.cpp writes the answer and reads the next
+                // operands from files, which evicts the caches; without the same
+                // here the tuning underrated the output's zero fill (container,
+                // N = 65536: tuned 2.4-2.6 ms, real cases 3.4-3.7 ms).
+                std::fill(flush.begin(), flush.end(), static_cast<char>(r));
+                const auto t0 = HostClock::now();
+                fherma_run(s, warm);
+                t.push_back(std::chrono::duration<double>(HostClock::now() - t0).count());
+            }
+            std::sort(t.begin(), t.end());
+            const double med = t[3];
+            if (std::getenv("FHERMA_AUTOTUNE_LOG")) {
+                std::fprintf(stderr, "autotune: in %d out %d  median %.1f us\n", static_cast<int>(c.first),
+                             static_cast<int>(c.second), med * 1e6);
+            }
+            // The default (first) stands unless another is clearly faster: a
+            // wrong pick from noise cost 50 % once (container, N = 32768).
+            if (c == candidates[0] ? med < best : med < 0.95 * best) {
+                best = med;
+                pick = c;
+            }
+        }
+        if (candidates.size() > 1) {
+            configure(*s, pick.first, pick.second);
+            fherma_run(s, warm);                     // leave the chosen mode warm
+        }
         s->profile = profile;
     } catch (...) {
         fherma_free(s);
